@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large model files — uncomment if you switch to Git LFS instead of
+# committing .pkl files directly (see README_DEPLOYMENT.md)
+# models/*.pkl
+
+# Local test/scratch data — never commit synthetic or placeholder data
+TEST_DATA*.csv
+*_do_not_use_for_analysis.csv

@@ -1,0 +1,25 @@
+streamlit>=1.32
+numpy>=1.24
+pandas>=1.5
+matplotlib>=3.7
+requests>=2.28
+rdkit>=2023.9.1
+scikit-learn>=1.3
+xgboost>=1.7
+
+# NOTE on scikit-learn / xgboost versions:
+# The Tier 1/2/3, ABC (rf/xgb), and calibration models are loaded from
+# pickled objects in models/. Pickled sklearn/xgboost models are only
+# guaranteed to unpickle cleanly with a version that's compatible with
+# whatever version they were trained/pickled with -- if you hit an
+# unpickling error or a silent accuracy drop after deploying, check the
+# scikit-learn/xgboost version used locally when the .pkl files were
+# created (pip show scikit-learn / pip show xgboost) and pin these two
+# lines to match exactly before troubleshooting anything else.
+#
+# scikit-learn is also used at runtime (not just for the pickled models)
+# for the optional Gaussian Process surrogate fit in the "My Chip" tab
+# once a user has 6+ calibration compounds -- the app degrades gracefully
+# to a linear fit if scikit-learn is somehow unavailable, but since it's
+# already required for the pickled models above, it will always be
+# present in this deployment.
