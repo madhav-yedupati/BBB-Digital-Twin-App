@@ -694,7 +694,8 @@ def normalize_calibration_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename_map)
 
 
-def fit_user_surrogate(cal_df: pd.DataFrame, baseline_col="final_kp", empirical_col="empirical_kp"):
+def fit_user_surrogate(cal_df: pd.DataFrame, baseline_col="final_kp", empirical_col="empirical_kp",
+                        mechanism_col="efflux_liability"):
     """Fits a chip-specific calibration from a small table of
     (baseline model prediction, this user's own measured Kp) pairs.
 
@@ -707,6 +708,16 @@ def fit_user_surrogate(cal_df: pd.DataFrame, baseline_col="final_kp", empirical_
         which gives a smoothly shrinking uncertainty band and doesn't force
         a single global slope on a handful of points.
     Falls back one tier down automatically if scikit-learn isn't installed.
+
+    When `mechanism_col` is present and has a valid (non-NaN) value for
+    every usable row, the GP branch fits on 2 input dimensions -- log
+    baseline Kp AND the compound's efflux liability (ABC classifier
+    P(substrate)+P(both), already computed by predict_one_compound for
+    every compound, calibration or new) -- instead of just 1. This lets
+    the surrogate learn patterns like "the chip under-reads confirmed
+    P-gp substrates" as a function of mechanism, not only of where the
+    baseline Kp value happens to fall. If the column is missing or has
+    gaps, this falls back to the original 1D (Kp-only) fit automatically.
     """
     valid = cal_df.dropna(subset=[baseline_col, empirical_col])
     valid = valid[(valid[baseline_col] > 0) & (valid[empirical_col] > 0)]
@@ -718,19 +729,75 @@ def fit_user_surrogate(cal_df: pd.DataFrame, baseline_col="final_kp", empirical_
     x = np.log(valid[baseline_col].values.astype(float))
     y = np.log(valid[empirical_col].values.astype(float))
 
+    use_mechanism = (
+        mechanism_col in valid.columns
+        and valid[mechanism_col].notna().all()
+        and n >= 6
+    )
+
     if n >= 6:
         try:
             from sklearn.gaussian_process import GaussianProcessRegressor
             from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
-            kernel = ConstantKernel(1.0, (1e-2, 1e2)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2)) \
+            from sklearn.model_selection import LeaveOneOut
+
+            if use_mechanism:
+                mech = valid[mechanism_col].values.astype(float)
+                X = np.column_stack([x, mech])
+                length_scale0 = [1.0, 1.0]
+            else:
+                X = x.reshape(-1, 1)
+                length_scale0 = 1.0
+
+            # Prior mean = identity on the baseline-Kp dimension only
+            # (y = x), i.e. "assume the baseline model needs no
+            # correction until this chip's data says otherwise." The
+            # GP only has to learn the *residual* correction -- as a
+            # function of Kp alone, or of Kp + mechanism when available
+            # -- rather than the whole log-Kp curve from scratch.
+            # Without this, GaussianProcessRegressor's default zero/
+            # mean-of-y prior makes the fit collapse to a flat line
+            # wherever calibration points are sparse.
+            residual = y - x
+
+            # Wider length-scale lower bound than sklearn's default.
+            # With only 6-10 calibration points, a very short length
+            # scale lets the optimizer chase individual points into a
+            # wiggly, physically implausible curve instead of a smooth
+            # trend.
+            kernel = ConstantKernel(1.0, (1e-2, 1e2)) \
+                     * RBF(length_scale=length_scale0, length_scale_bounds=(3e-1, 1e2)) \
                      + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-3, 2.0))
-            gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True, n_restarts_optimizer=3, random_state=0)
-            gp.fit(x.reshape(-1, 1), y)
-            y_fit, _ = gp.predict(x.reshape(-1, 1), return_std=True)
+
+            def _fit_gp(XX, resid):
+                g = GaussianProcessRegressor(kernel=kernel, normalize_y=False, n_restarts_optimizer=3, random_state=0)
+                g.fit(XX, resid)
+                return g
+
+            gp = _fit_gp(X, residual)
+            resid_fit, _ = gp.predict(X, return_std=True)
+            y_fit = x + resid_fit
             ss_res = float(np.sum((y - y_fit) ** 2))
             ss_tot = float(np.sum((y - np.mean(y)) ** 2))
             r2 = 1 - ss_res / ss_tot if ss_tot > 0 else None
-            return {"method": "gp", "model": gp, "n": n, "r2": r2, "x_train": x, "y_train": y}
+
+            # Leave-one-out R² -- the honest number to report at n=6-10.
+            # In-sample R² barely means anything at this sample size,
+            # since a flexible-enough GP can always fit the points it
+            # was trained on; LOO actually tests predictive power.
+            loo = LeaveOneOut()
+            loo_preds = np.zeros_like(y)
+            for tr_idx, te_idx in loo.split(X):
+                g_i = _fit_gp(X[tr_idx], residual[tr_idx])
+                r_pred, _ = g_i.predict(X[te_idx], return_std=True)
+                loo_preds[te_idx] = x[te_idx] + r_pred
+            ss_res_loo = float(np.sum((y - loo_preds) ** 2))
+            r2_loo = 1 - ss_res_loo / ss_tot if ss_tot > 0 else None
+
+            return {"method": "gp", "model": gp, "n": n, "r2": r2, "r2_loo": r2_loo,
+                    "uses_mechanism": use_mechanism,
+                    "mechanism_mean": float(np.mean(X[:, 1])) if use_mechanism else None,
+                    "x_train": x, "y_train": y}
         except ImportError:
             pass  # fall through to linear
 
@@ -751,18 +818,30 @@ def fit_user_surrogate(cal_df: pd.DataFrame, baseline_col="final_kp", empirical_
             "resid_std": None, "n": n, "r2": None, "x_train": x, "y_train": y}
 
 
-def apply_user_surrogate(calib: dict, baseline_kp: float):
+def apply_user_surrogate(calib: dict, baseline_kp: float, mechanism_val: float = None):
     """Applies a fitted chip-calibration to one baseline Kp prediction.
     Returns (corrected_kp, lower_95, upper_95) -- bounds are None when the
-    fit has no usable uncertainty estimate (e.g. an exact 2-point line)."""
+    fit has no usable uncertainty estimate (e.g. an exact 2-point line).
+
+    mechanism_val: this compound's efflux_liability, used only when the
+    fitted calibration is mechanism-aware (calib["uses_mechanism"]). If
+    omitted (e.g. when sweeping a Kp-only curve for the calibration
+    plot), falls back to the mean mechanism value seen during training
+    so the call still succeeds -- just without a mechanism-specific
+    correction for that particular point."""
     if calib is None or calib.get("method") in (None, "none") or baseline_kp is None or baseline_kp <= 0:
         return None, None, None
 
     x = np.log(baseline_kp)
 
     if calib["method"] == "gp":
-        mean, std = calib["model"].predict(np.array([[x]]), return_std=True)
-        y, s = float(mean[0]), float(std[0])
+        if calib.get("uses_mechanism"):
+            mech = mechanism_val if mechanism_val is not None else calib["mechanism_mean"]
+            X_new = np.array([[x, float(mech)]])
+        else:
+            X_new = np.array([[x]])
+        resid_mean, std = calib["model"].predict(X_new, return_std=True)
+        y, s = x + float(resid_mean[0]), float(std[0])
         return float(np.exp(y)), float(np.exp(y - 1.96 * s)), float(np.exp(y + 1.96 * s))
 
     if calib["method"] == "linear":
@@ -781,9 +860,15 @@ def surrogate_calibration_summary(calib: dict) -> str:
         return "No chip calibration fitted yet."
     n = calib["n"]
     if calib["method"] == "gp":
-        r2 = calib.get("r2")
-        r2_txt = f", in-sample fit R²={r2:.3f}" if r2 is not None else ""
-        return f"Gaussian Process surrogate fit on {n} of your compounds{r2_txt}. Uncertainty bands widen for new compounds far from your calibration set."
+        r2, r2_loo = calib.get("r2"), calib.get("r2_loo")
+        if r2_loo is not None:
+            r2_txt = f", leave-one-out R²={r2_loo:.3f}" + (f" (in-sample R²={r2:.3f})" if r2 is not None else "")
+        elif r2 is not None:
+            r2_txt = f", in-sample fit R²={r2:.3f}"
+        else:
+            r2_txt = ""
+        mech_txt = " (also using efflux liability as a second input, not just baseline Kp)" if calib.get("uses_mechanism") else ""
+        return f"Gaussian Process surrogate fit on {n} of your compounds{r2_txt}{mech_txt}. Uncertainty bands widen for new compounds far from your calibration set."
     if calib["method"] == "linear":
         slope, intercept = calib["slope"], calib["intercept"]
         r2 = calib.get("r2")
@@ -981,6 +1066,67 @@ def confidence_bar(conf):
         unsafe_allow_html=True,
     )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BETA ACCESS GATE
+# ══════════════════════════════════════════════════════════════════════════════
+# Keeps the app itself public (works on any free host, no dependency on a
+# platform's "private app" tier/limits) while restricting real access to a
+# beta group. Configure via Streamlit secrets — nothing sensitive is
+# hardcoded here or committed to the repo:
+#
+#   .streamlit/secrets.toml (local) or the "Secrets" panel in your host's
+#   dashboard (Streamlit Community Cloud / Hugging Face Spaces):
+#
+#       [beta_access]
+#       password = "some-shared-passphrase"
+#       allowed_emails = ["name@domain.com", "name2@domain.edu"]
+#
+# Either field alone is enough (shared password only, or email-list only);
+# both together requires both. Leaving [beta_access] out of secrets entirely
+# disables the gate (useful for local dev / once beta testing ends).
+def _beta_gate() -> bool:
+    try:
+        # st.secrets raises (not just returns falsy) when no secrets.toml
+        # exists at all -- e.g. local dev before any secrets are set up, or
+        # a deploy where secrets haven't been configured yet. Treat that the
+        # same as "gate not configured" rather than crashing the whole app.
+        cfg = st.secrets.get("beta_access", {})
+    except Exception:
+        cfg = {}
+    required_password = cfg.get("password")
+    allowed_emails = set(e.strip().lower() for e in cfg.get("allowed_emails", []))
+
+    if not required_password and not allowed_emails:
+        return True  # gate not configured -> app is open
+
+    if st.session_state.get("beta_access_ok"):
+        return True
+
+    st.title("🧠 CNS Drug Penetration Predictor")
+    st.caption("Barrile Lab · University of Cincinnati · GBM Drug Discovery Pipeline")
+    st.info("This is a limited beta. Enter your access details to continue.")
+
+    with st.form("beta_access_form"):
+        email = st.text_input("Email") if allowed_emails else None
+        pw = st.text_input("Access password", type="password") if required_password else None
+        submitted = st.form_submit_button("Enter")
+
+    if submitted:
+        email_ok = (not allowed_emails) or (email and email.strip().lower() in allowed_emails)
+        pw_ok = (not required_password) or (pw == required_password)
+        if email_ok and pw_ok:
+            st.session_state["beta_access_ok"] = True
+            st.session_state["beta_access_email"] = email
+            st.rerun()
+        else:
+            st.error("Access details not recognized. Contact the Barrile Lab for beta access.")
+
+    return False
+
+
+if not _beta_gate():
+    st.stop()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APP LAYOUT
@@ -1782,7 +1928,10 @@ with tab6:
                     ax.set_xscale("log"); ax.set_yscale("log")
                     ax.set_xlabel("Baseline model Final Kp")
                     ax.set_ylabel("Your empirical Kp")
-                    ax.set_title("Chip calibration fit")
+                    ax.set_title("Chip calibration fit" + (
+                        "\n(shown at mean efflux liability -- actual predictions also use each compound's own value)"
+                        if calib.get("uses_mechanism") else ""
+                    ), fontsize=9)
                     ax.legend(fontsize=8)
                     fig.tight_layout()
                     st.pyplot(fig)
@@ -1821,7 +1970,9 @@ with tab6:
                     if rec.get("note"):
                         st.error(f"Baseline pipeline failed: {rec['note']}")
                     else:
-                        corrected, lo, hi = apply_user_surrogate(st.session_state["user_surrogate"], rec["final_kp"])
+                        corrected, lo, hi = apply_user_surrogate(
+                            st.session_state["user_surrogate"], rec["final_kp"], rec.get("efflux_liability")
+                        )
                         c1, c2, c3 = st.columns(3)
                         c1.metric("Baseline Final Kp", f"{rec['final_kp']:.4f}")
                         c2.metric("Your chip's predicted Kp", f"{corrected:.4f}" if corrected is not None else "n/a")
@@ -1864,7 +2015,9 @@ with tab6:
 
                         status.text(f"Predicting: {name_val or smiles_val[:20]} …")
                         rec = predict_one_compound(models, name_val, smiles_val, pubchem_error=pubchem_error)
-                        corrected, lo, hi = apply_user_surrogate(st.session_state["user_surrogate"], rec.get("final_kp"))
+                        corrected, lo, hi = apply_user_surrogate(
+                            st.session_state["user_surrogate"], rec.get("final_kp"), rec.get("efflux_liability")
+                        )
                         rec["your_chip_kp"] = round(corrected, 4) if corrected is not None else None
                         rec["your_chip_kp_lo95"] = round(lo, 4) if lo is not None else None
                         rec["your_chip_kp_hi95"] = round(hi, 4) if hi is not None else None
