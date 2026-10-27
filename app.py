@@ -235,6 +235,13 @@ def run_tier3(models, feats):
     m = models["tier3"]
     if m is None:
         return None
+    # Tier 3 layout is fingerprint-FIRST (2048 Morgan bits, then the 8 physchem
+    # descriptors), unlike Tier 1/2 which are physchem-first. Determined empirically:
+    # with the physchem-first layout Tier 3 returned ~0.6 for every drug (no signal);
+    # fingerprint-first spreads predictions 0.13-0.89 and tracks literature PPB
+    # (r = 0.81 on 13 reference drugs). Still unverified against the training script.
+    n_phys = feats.shape[1] - 2048
+    feats = np.hstack([feats[:, n_phys:], feats[:, :n_phys]])
     fu = float(m.predict(feats)[0])
     fu = max(0.001, min(1.0, fu))        # clamp to [0.001, 1.0]
     return fu
@@ -1212,104 +1219,43 @@ with tab1:
             manual_uptake_transporter = st.text_input("Transporter (e.g. OATP1B1, OCT/OCTN1)", value="")
         manual_uptake_note = st.text_area("Evidence note / citation", value="", height=60)
 
+
+    # ── Analysis mode (Basic / Advanced) ──────────────────────────────────────
+    t1_mode = st.radio(
+        "Analysis mode",
+        ["Basic", "Advanced"],
+        horizontal=True,
+        key="t1_mode",
+        help=(
+            "Basic: passive transport, efflux pumps, albumin binding and a plain-language "
+            "conclusion. Advanced: full tier-by-tier outputs, decision report, method notes "
+            "and the known blind spots of the analysis."
+        ),
+    )
+
     predict_btn = st.button("🚀 Run Full Pipeline", type="primary", use_container_width=False)
 
+    # Compute once on click and keep in session_state, so flipping Basic/Advanced
+    # re-renders the same result instead of discarding it.
     if predict_btn:
         smiles = smiles_input.strip()
         if not smiles:
+            st.session_state.pop("t1_res", None)
             st.warning("Please enter a SMILES string or use the PubChem lookup first.")
         else:
             try:
                 tier123_feats, abc_feats, mol = featurize(smiles)
                 phys = get_physchem(mol)
-
-                st.markdown("---")
-
-                # ── Physicochemical summary ────────────────────────────────
-                with st.expander("📐 Physicochemical Properties", expanded=False):
-                    pcols = st.columns(5)
-                    labels = {
-                        "MolWt": "MW (Da)", "MolLogP": "logP",
-                        "NumHDonors": "H-Donors", "NumHAcceptors": "H-Acceptors",
-                        "TPSA": "TPSA (Å²)", "NumRotatableBonds": "RotBonds",
-                        "RingCount": "Rings", "NumAromaticRings": "Arom. Rings",
-                        "HeavyAtomCount": "Heavy Atoms", "FractionCSP3": "Fsp³",
-                    }
-                    for i, (k, label) in enumerate(labels.items()):
-                        with pcols[i % 5]:
-                            st.metric(label, f"{phys[k]:.2f}")
-
-                # ── Tier 1 ─────────────────────────────────────────────────
-                st.markdown("### Tier 1 — BBB Classification")
                 t1_pred, t1_conf = run_tier1(models, tier123_feats)
-                if t1_pred is not None:
-                    c1, c2 = st.columns([2, 3])
-                    with c1:
-                        st.markdown(bbb_badge(t1_pred))
-                    with c2:
-                        confidence_bar(t1_conf)
-                else:
-                    st.info("Tier 1 model not loaded.")
-
-                # ── Tier 2 ─────────────────────────────────────────────────
-                st.markdown("### Tier 2 — logBB Regression")
                 t2_logbb = run_tier2(models, tier123_feats)
-                if t2_logbb is not None:
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("logBB", f"{t2_logbb:.3f}")
-                    c2.metric("BBB Ratio (linear)", f"{10**t2_logbb:.3f}")
-                    interp = (
-                        "Good penetration" if t2_logbb > 0.3
-                        else "Moderate" if t2_logbb > -0.5
-                        else "Poor penetration"
-                    )
-                    c3.metric("Interpretation", interp)
-                else:
-                    st.info("Tier 2 model not loaded.")
-
-                # ── Tier 3 ─────────────────────────────────────────────────
-                st.markdown("### Tier 3 — Plasma Protein Binding (PPB)")
                 t3_fu = run_tier3(models, tier123_feats)
-                if t3_fu is not None:
-                    ppb_pct = (1 - t3_fu) * 100
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("fu plasma", f"{t3_fu:.3f}")
-                    c2.metric("PPB %", f"{ppb_pct:.1f}%")
-                    bound_label = (
-                        "Highly bound" if ppb_pct > 90
-                        else "Moderately bound" if ppb_pct > 60
-                        else "Low binding"
-                    )
-                    c3.metric("Binding class", bound_label)
-                else:
-                    st.info("Tier 3 model not loaded.")
-
-                # ── ABC Transporter (efflux liability) ─────────────────────
-                st.markdown("### ABC Efflux Transporter")
                 abc_result = run_abc(models, abc_feats)
-                if abc_result is not None:
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Predicted class", abc_result["label"])
-                    c2.metric("Efflux liability", f"{abc_result['efflux_liability']:.3f}")
-                    c3.metric("P(Substrate) / P(Both)",
-                              f"{abc_result['proba'].get('Substrate', 0):.2f} / {abc_result['proba'].get('Both', 0):.2f}")
-                    st.caption("Efflux liability = P(Substrate) + P(Both) — the scalar fed into the Decision Layer's efflux gate.")
-                else:
-                    st.info("ABC transporter model(s) not loaded.")
 
-                # ── Decision Layer / Biological Agents / Decision Engine ───
+                final_kp = decision = matched = None
+                predicted_kp = None
+                compound_display_name = drug_name.strip() or smiles[:24]
                 if t2_logbb is not None and abc_result is not None:
-                    st.markdown("### 🧭 Decision Layer — Structured Decision Report")
-                    st.caption(
-                        "Compound → Tier 1 BBB predictor → BBB Digital Twin → Decision Layer → "
-                        "Biological Agents (Efflux, Uptake) → Decision Engine → Final Prediction + Biological Explanation"
-                    )
-
-                    # predicted_kp = 10^logBB (logBB defined as log10(Cbrain/Cplasma));
-                    # this is the Digital Twin's own Kp estimate *before* Decision Layer correction.
                     predicted_kp = 10 ** t2_logbb
-
-                    compound_display_name = drug_name.strip() or smiles[:24]
                     final_kp, decision, matched, predicted_kp = run_decision_layer(
                         compound_display_name, predicted_kp, abc_result["efflux_liability"],
                         uptake_evidence_p=manual_uptake_p,
@@ -1317,45 +1263,306 @@ with tab1:
                         uptake_note=manual_uptake_note,
                     )
 
-                    if matched:
-                        st.success(
-                            f"✅ Matched to validated calibration compound **{matched}** — using the "
-                            "published DT prediction / efflux score from the notebook (not a fresh live "
-                            "re-inference), plus the curated literature discount/uptake evidence."
-                        )
-
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("DT alone (Kp)", f"{predicted_kp:.4f}")
-                    c2.metric("Final Kp (Decision Layer corrected)", f"{final_kp:.4f}")
-                    c3.metric("rel_passive", f"{decision['rel_passive']:.3f}")
-
-                    decision_card("Efflux", decision["efflux"])
-                    decision_card("Uptake", decision["uptake"])
-
-                # ── Digital Twin Papp estimate (legacy Sugano-prior view) ──
+                efflux_ratio = 1.0
+                papp_plasma = papp_free = None
+                if abc_result is not None:
+                    efflux_ratio = max(1.0, 1.0 + 0.5 * abc_result["efflux_liability"])
                 if t2_logbb is not None and t3_fu is not None:
-                    st.markdown("### Digital Twin — Papp Estimate (Sugano-prior view)")
-                    efflux_ratio = 1.0
-                    if abc_result is not None:
-                        efflux_ratio = max(1.0, 1.0 + 0.5 * abc_result["efflux_liability"])
+                    papp_plasma = digital_twin_papp(t2_logbb, t3_fu, efflux_ratio)
+                    papp_free = digital_twin_papp(t2_logbb, 1.0, efflux_ratio)
 
-                    papp_plasma    = digital_twin_papp(t2_logbb, t3_fu, efflux_ratio)
-                    papp_serum_free = digital_twin_papp(t2_logbb, 1.0, efflux_ratio)
-
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Papp (plasma)", f"{papp_plasma:.2f} ×10⁻⁶ cm/s")
-                    c2.metric("Papp (serum-free)", f"{papp_serum_free:.2f} ×10⁻⁶ cm/s")
-                    c3.metric("Efflux ratio", f"{efflux_ratio:.1f}×")
-                    st.caption(
-                        "Formula: Papp,free = 10^((logBB − β) / α)  ·  "
-                        "Papp,plasma = Papp,free × fu_plasma / efflux_ratio  "
-                        "(α=1.99, β=0.357; Sugano 2010 priors — pending on-chip calibration). "
-                        "This is a separate, older mechanistic view; the Decision Layer's Final Kp above "
-                        "is the current frozen-architecture output."
-                    )
-
+                st.session_state["t1_res"] = dict(
+                    smiles=smiles, name=compound_display_name, phys=phys,
+                    t1_pred=t1_pred, t1_conf=t1_conf, t2_logbb=t2_logbb, t3_fu=t3_fu,
+                    abc=abc_result, final_kp=final_kp, decision=decision, matched=matched,
+                    predicted_kp=predicted_kp, efflux_ratio=efflux_ratio,
+                    papp_plasma=papp_plasma, papp_free=papp_free,
+                )
             except ValueError as e:
+                st.session_state.pop("t1_res", None)
                 st.error(str(e))
+
+    res = st.session_state.get("t1_res")
+    if res:
+        st.markdown("---")
+        phys, t1_pred, t1_conf = res["phys"], res["t1_pred"], res["t1_conf"]
+        t2_logbb, t3_fu, abc_result = res["t2_logbb"], res["t3_fu"], res["abc"]
+        decision, matched = res["decision"], res["matched"]
+        st.caption(f"Showing results for **{res['name']}** · mode: **{t1_mode}**"
+                   + ("" if res["smiles"] == smiles_input.strip() else
+                      " · ⚠ the SMILES box has changed since this run — press Run again to update."))
+
+        # ── shared interpretation helpers ─────────────────────────────────────
+        def _ppb_class(fu):
+            p = (1 - fu) * 100
+            return "Highly bound" if p > 90 else "Moderately bound" if p > 60 else "Low binding"
+
+        def _passive_class(rp):
+            return "High" if rp >= 0.6 else "Moderate" if rp >= EFFLUX_THRESHOLD else "Low"
+
+        def _conclusion():
+            parts = []
+            if decision is not None:
+                rp = decision["rel_passive"]
+                parts.append(
+                    f"**Passive transport** is predicted to be **{_passive_class(rp).lower()}** "
+                    f"(rel_passive {rp:.2f}; digital-twin Kp {res['predicted_kp']:.3f}, "
+                    f"logBB {t2_logbb:.2f})."
+                )
+            elif t2_logbb is not None:
+                parts.append(f"**Passive transport**: predicted logBB {t2_logbb:.2f}.")
+            if abc_result is not None:
+                liab = abc_result["efflux_liability"]
+                lvl = "high" if liab >= 0.6 else "moderate" if liab >= 0.3 else "low"
+                eff_txt = f"**Efflux pumps**: {lvl} liability ({liab:.2f}; class: {abc_result['label']})"
+                if decision is not None and decision["efflux"].intervention_required:
+                    eff_txt += (f". The Decision Layer applies an efflux correction "
+                                f"({decision['efflux'].selected_mechanism}), lowering brain Kp "
+                                f"to {res['final_kp']:.3f}.")
+                else:
+                    eff_txt += ". No efflux correction was applied."
+                parts.append(eff_txt)
+            if t3_fu is not None:
+                parts.append(
+                    f"**Albumin/plasma binding**: {_ppb_class(t3_fu).lower()} "
+                    f"(fu {t3_fu:.3f}, ~{(1 - t3_fu) * 100:.1f}% bound)."
+                )
+            # one-line overall read
+            if decision is not None and abc_result is not None:
+                rp, liab = decision["rel_passive"], abc_result["efflux_liability"]
+                if rp >= 0.6 and liab < 0.3:
+                    overall = "Overall: favourable for brain entry — passive diffusion dominates and efflux is not expected to limit it."
+                elif rp >= 0.6:
+                    ratio = (res["final_kp"] / res["predicted_kp"]) if res["predicted_kp"] else 1.0
+                    if ratio >= 0.8:
+                        overall = ("Overall: favourable for brain entry — intrinsically permeable, with efflux "
+                                   f"expected to trim brain Kp only modestly (~{(1 - ratio) * 100:.0f}% reduction).")
+                    elif ratio >= 0.5:
+                        overall = ("Overall: permeable, but efflux is expected to meaningfully reduce brain exposure "
+                                   f"(~{(1 - ratio) * 100:.0f}% lower Kp).")
+                    else:
+                        overall = ("Overall: intrinsically permeable, but efflux is the main expected limiter of "
+                                   f"brain exposure (~{(1 - ratio) * 100:.0f}% lower Kp).")
+                elif liab >= 0.3:
+                    overall = ("Overall: unfavourable — brain entry is limited by low passive permeability. "
+                               "Efflux liability is high, but the Decision Layer treats its additional effect "
+                               "as negligible when passive permeability is already this low.")
+                else:
+                    overall = "Overall: limited by low passive permeability rather than efflux."
+                if t3_fu is not None and t3_fu < 0.05:
+                    overall += " Strong plasma binding further reduces the free fraction available to cross."
+                parts.append(overall)
+            return parts
+
+        # ═════════════════════════ BASIC ═════════════════════════
+        if t1_mode == "Basic":
+            st.markdown("### 1 · Passive transport")
+            if decision is not None:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Passive permeability", _passive_class(decision["rel_passive"]),
+                          help="Classified from rel_passive (Hill function of the digital-twin Kp).")
+                c2.metric("rel_passive", f"{decision['rel_passive']:.3f}")
+                c3.metric("logBB (predicted)", f"{t2_logbb:.2f}")
+            elif t2_logbb is not None:
+                st.metric("logBB (predicted)", f"{t2_logbb:.2f}")
+            else:
+                st.info("Passive-transport models not loaded.")
+
+            st.markdown("### 2 · Efflux pumps (P-gp / BCRP / MRP)")
+            if abc_result is not None:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Predicted class", abc_result["label"])
+                c2.metric("Efflux liability", f"{abc_result['efflux_liability']:.2f}")
+                c3.metric("Efflux correction applied",
+                          "Yes" if (decision is not None and decision["efflux"].intervention_required) else "No")
+            else:
+                st.info("ABC transporter model(s) not loaded.")
+
+            st.markdown("### 3 · Albumin / plasma protein binding")
+            if t3_fu is not None:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("fu plasma", f"{t3_fu:.3f}")
+                c2.metric("PPB %", f"{(1 - t3_fu) * 100:.1f}%")
+                c3.metric("Binding class", _ppb_class(t3_fu))
+            else:
+                st.info("Tier 3 model not loaded.")
+
+            st.markdown("### Conclusion")
+            with st.container(border=True):
+                for p in _conclusion():
+                    st.markdown(p)
+            st.caption("Switch to **Advanced** for tier-by-tier detail, the decision report, "
+                       "method notes and known blind spots.")
+
+        # ═════════════════════════ ADVANCED ═════════════════════════
+        else:
+            with st.expander("📐 Physicochemical Properties", expanded=False):
+                pcols = st.columns(5)
+                labels = {
+                    "MolWt": "MW (Da)", "MolLogP": "logP",
+                    "NumHDonors": "H-Donors", "NumHAcceptors": "H-Acceptors",
+                    "TPSA": "TPSA (Å²)", "NumRotatableBonds": "RotBonds",
+                    "RingCount": "Rings", "NumAromaticRings": "Arom. Rings",
+                    "HeavyAtomCount": "Heavy Atoms", "FractionCSP3": "Fsp³",
+                }
+                for i, (k, label) in enumerate(labels.items()):
+                    with pcols[i % 5]:
+                        st.metric(label, f"{phys[k]:.2f}")
+
+            st.markdown("### Tier 1 — BBB Classification")
+            if t1_pred is not None:
+                c1, c2 = st.columns([2, 3])
+                with c1:
+                    st.markdown(bbb_badge(t1_pred))
+                with c2:
+                    confidence_bar(t1_conf)
+            else:
+                st.info("Tier 1 model not loaded.")
+
+            st.markdown("### Tier 2 — logBB Regression")
+            if t2_logbb is not None:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("logBB", f"{t2_logbb:.3f}")
+                c2.metric("BBB Ratio (linear)", f"{10**t2_logbb:.3f}")
+                c3.metric("Interpretation",
+                          "Good penetration" if t2_logbb > 0.3
+                          else "Moderate" if t2_logbb > -0.5 else "Poor penetration")
+            else:
+                st.info("Tier 2 model not loaded.")
+
+            st.markdown("### Tier 3 — Plasma Protein Binding (PPB)")
+            if t3_fu is not None:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("fu plasma", f"{t3_fu:.3f}")
+                c2.metric("PPB %", f"{(1 - t3_fu) * 100:.1f}%")
+                c3.metric("Binding class", _ppb_class(t3_fu))
+                st.caption("Tier 3 predicts total plasma protein binding (albumin + α1-acid glycoprotein + "
+                           "lipoproteins), not albumin alone. fu is clamped to [0.001, 1.0].")
+            else:
+                st.info("Tier 3 model not loaded.")
+
+            st.markdown("### ABC Efflux Transporter")
+            if abc_result is not None:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Predicted class", abc_result["label"])
+                c2.metric("Efflux liability", f"{abc_result['efflux_liability']:.3f}")
+                c3.metric("P(Substrate) / P(Both)",
+                          f"{abc_result['proba'].get('Substrate', 0):.2f} / {abc_result['proba'].get('Both', 0):.2f}")
+                st.caption("Efflux liability = P(Substrate) + P(Both) — the scalar fed into the Decision Layer's efflux gate.")
+            else:
+                st.info("ABC transporter model(s) not loaded.")
+
+            if decision is not None:
+                st.markdown("### 🧭 Decision Layer — Structured Decision Report")
+                st.caption(
+                    "Compound → Tier 1 BBB predictor → BBB Digital Twin → Decision Layer → "
+                    "Biological Agents (Efflux, Uptake) → Decision Engine → Final Prediction + Biological Explanation"
+                )
+                if matched:
+                    st.success(
+                        f"✅ Matched to validated calibration compound **{matched}** — using the "
+                        "published DT prediction / efflux score from the notebook (not a fresh live "
+                        "re-inference), plus the curated literature discount/uptake evidence."
+                    )
+                c1, c2, c3 = st.columns(3)
+                c1.metric("DT alone (Kp)", f"{res['predicted_kp']:.4f}")
+                c2.metric("Final Kp (Decision Layer corrected)", f"{res['final_kp']:.4f}")
+                c3.metric("rel_passive", f"{decision['rel_passive']:.3f}")
+                decision_card("Efflux", decision["efflux"])
+                decision_card("Uptake", decision["uptake"])
+
+            if res["papp_plasma"] is not None:
+                st.markdown("### Digital Twin — Papp Estimate (Sugano-prior view)")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Papp (plasma)", f"{res['papp_plasma']:.2f} ×10⁻⁶ cm/s")
+                c2.metric("Papp (serum-free)", f"{res['papp_free']:.2f} ×10⁻⁶ cm/s")
+                c3.metric("Efflux ratio", f"{res['efflux_ratio']:.1f}×")
+                st.caption(
+                    "Formula: Papp,free = 10^((logBB − β) / α)  ·  "
+                    "Papp,plasma = Papp,free × fu_plasma / efflux_ratio  "
+                    "(α=1.99, β=0.357; Sugano 2010 priors — pending on-chip calibration). "
+                    "This is a separate, older mechanistic view; the Decision Layer's Final Kp above "
+                    "is the current frozen-architecture output. ⚠ Absolute Papp magnitudes are "
+                    "unit-unverified (values can come out implausibly large) — use for relative "
+                    "ranking only until calibrated."
+                )
+
+            st.markdown("### Conclusion")
+            with st.container(border=True):
+                for p in _conclusion():
+                    st.markdown(p)
+
+            # ── Compound-specific flags ───────────────────────────────────────
+            flags = []
+            if t3_fu is not None and t3_fu < 0.05:
+                flags.append("**Highly bound (fu < 0.05):** PPB regressors are least accurate at the "
+                              "extremes, and small absolute errors in % bound become large relative "
+                              "errors in fu. Treat fu as order-of-magnitude and check against "
+                              "literature values where available.")
+            if phys["MolWt"] > 500:
+                flags.append(f"**Large molecule (MW {phys['MolWt']:.0f} Da):** the BBB training "
+                              "sets are dominated by small CNS-like molecules; large/peptidic or "
+                              "natural-product-like compounds may fall outside the applicability domain.")
+            if phys["TPSA"] > 140:
+                flags.append(f"**High TPSA ({phys['TPSA']:.0f} Å²):** well outside the typical "
+                              "CNS-penetrant range; predictions are likely less reliable here.")
+            if matched:
+                flags.append(f"**Calibration compound:** this result uses the published notebook "
+                              f"values for {matched}, so it is not an independent test of the model.")
+            if abc_result is not None and 0.3 <= abc_result["efflux_liability"] < 0.6:
+                flags.append("**Borderline efflux liability:** the soft-vote sits near the gate "
+                              "threshold, so the efflux correction may flip with small changes.")
+            if flags:
+                st.markdown("#### ⚑ Flags for this compound")
+                for f in flags:
+                    st.markdown(f"- {f}")
+
+            # ── Notes & blind spots ───────────────────────────────────────────
+            with st.expander("📝 Method notes", expanded=False):
+                st.markdown(
+                    "- **Tiers 1–3** use RDKit physicochemical descriptors and fingerprints; "
+                    "Tier 1 is a consensus classifier, Tier 2 a stacked logBB regressor, "
+                    "Tier 3 a plasma fu regressor.\n"
+                    "- **Efflux** is an RF + XGBoost soft-vote over P-gp/BCRP/MRP substrate labels; "
+                    "liability = P(Substrate) + P(Both).\n"
+                    "- **Decision Layer v2** converts the digital-twin Kp into `rel_passive` "
+                    f"(Hill function, Kd={EFFLUX_KD}, n={EFFLUX_N}) and only applies an efflux "
+                    f"correction when passive permeability and transporter evidence both clear "
+                    f"the {EFFLUX_THRESHOLD} gate. Uptake corrections require curated literature "
+                    "evidence — they never come from an ML guess.\n"
+                    "- **Papp** uses Sugano-style priors (α=1.99, β=0.357) and is not yet calibrated "
+                    "to on-chip measurements."
+                )
+            with st.expander("⚠ Potential blind spots of this analysis", expanded=True):
+                st.markdown(
+                    "- **Healthy-BBB assumption.** Predictions describe an intact BBB; in glioblastoma "
+                    "the blood–tumour barrier is heterogeneously disrupted, so exposure in tumour "
+                    "core vs. infiltrating margin can differ substantially.\n"
+                    "- **Total vs. unbound exposure.** Kp and logBB are total-concentration ratios. "
+                    "Pharmacologically relevant Kp,uu (free brain / free plasma) also depends on "
+                    "brain tissue binding, which is not modelled.\n"
+                    "- **PPB is a regression estimate**, not a measurement, and is not albumin-specific. "
+                    "Error is largest for very highly bound drugs (fu < 0.05); species, assay "
+                    "method and concentration also vary across the literature it was trained on.\n"
+                    "- **Efflux is a substrate classifier**, not a transport-rate predictor. It does not "
+                    "capture transporter expression levels, saturation, or inhibition/drug–drug "
+                    "interactions.\n"
+                    "- **Uptake is not predicted.** The uptake agent fires only on curated literature "
+                    "evidence you supply; carrier-mediated brain entry (e.g. LAT1, OATP) is otherwise "
+                    "invisible to the model.\n"
+                    "- **Metabolism, active metabolites, prodrugs, and formulation** are not considered.\n"
+                    "- **Applicability domain.** Novel scaffolds, charged/zwitterionic species, large "
+                    "molecules and natural products may lie outside the training distribution. "
+                    "No explicit out-of-domain score is reported.\n"
+                    "- **Feature-order caveat.** The Tier 1/2/3 feature layouts were inferred "
+                    "rather than recovered from the pickles (see sidebar). Tier 3 (PPB) was found "
+                    "to use a fingerprint-first layout; checked only against ~13 reference drugs, "
+                    "where it ranks binding well (r≈0.8) but still under-predicts highly bound "
+                    "drugs — use as a rough estimate.\n"
+                    "- **In silico only.** Results are for prioritisation and hypothesis generation and "
+                    "should be confirmed with in vitro (chip) or in vivo data."
+                )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — BATCH SCREENING
@@ -2115,9 +2322,10 @@ session-only, never touches the shared model.
     st.markdown("---")
     with st.expander("⚠ Known caveat — verify before manuscript use"):
         st.caption(
-            "Tier 1/2/3 physchem feature order (`TIER123_PHYSCHEM_DESCS`) was "
-            "inferred, not recovered from the .pkl files (they carry no "
-            "feature_names_in_). Confirm it against the original training "
+            "Tier 1/2/3 feature layouts were inferred, not recovered from the .pkl "
+            "files (they carry no feature_names_in_). Tier 1/2 use physchem-first "
+            "(`TIER123_PHYSCHEM_DESCS`); Tier 3 was found empirically to need "
+            "fingerprint-first, validated only on ~13 reference drugs. Confirm against the original training "
             "script before trusting these outputs for the APL Bioengineering "
             "submission."
         )
