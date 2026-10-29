@@ -35,8 +35,9 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 ABC_LABEL_FALLBACK = {0: "Inhibitor", 1: "Substrate", 2: "Both"}
 
 # ── Physchem descriptor sets ────────────────────────────────────────────────
-# ABC (rf_final_v4 / xgb_final_v4): order taken verbatim from model_meta_v4.pkl
-# ("physchem_features": MW, LogP, TPSA, HBD, HBA, RotBonds) → 6 + 2048 Morgan = 2054.
+# ABC (rf_final_v4 / xgb_final_v4): physchem descriptor order from model_meta_v4.pkl
+# ("physchem_features": MW, LogP, TPSA, HBD, HBA, RotBonds). NOTE: the model expects
+# 2048 Morgan bits FIRST then these 6 (2054 total) -- the reorder happens in run_abc().
 ABC_PHYSCHEM_DESCS = ["MolWt", "MolLogP", "TPSA", "NumHDonors", "NumHAcceptors", "NumRotatableBonds"]
 
 # Tier 1/2/3 (bbb_tier1_consensus / bbb_tier2_stacked / tier3_ppb_model): these
@@ -255,6 +256,13 @@ def run_abc(models, abc_feats):
     rf, xgb = models.get("abc_rf"), models.get("abc_xgb")
     if rf is None or xgb is None:
         return None
+    # The ABC models' own metadata (model_meta_v4 "feature_names") lists the 2048
+    # Morgan bits FIRST and the 6 physchem descriptors LAST. featurize() builds
+    # physchem-first, so reorder here. Verified: with this layout the classifier
+    # reproduces the notebook's stored efflux_liability for caffeine, loperamide,
+    # carbamazepine and donepezil to 3 decimals; physchem-first does not.
+    n_phys = abc_feats.shape[1] - 2048
+    abc_feats = np.hstack([abc_feats[:, n_phys:], abc_feats[:, :n_phys]])
     proba = (rf.predict_proba(abc_feats)[0] + xgb.predict_proba(abc_feats)[0]) / 2.0
     meta = models.get("abc_meta") or {}
     inv_label = meta.get("inv_label", ABC_LABEL_FALLBACK)
@@ -1063,6 +1071,259 @@ def decision_card(mechanism_label, mech):
         st.caption(mech.explanation)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTERNAL / LLM COMPARISON PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+# Side-by-side view of our predictions vs. external tools (SwissADME, ADMETlab 3.0,
+# entered by hand -- neither offers a stable free API) and an optional LLM estimate.
+#
+# The LLM fetch is OFF unless an [llm] block exists in Streamlit secrets:
+#
+#       [llm]
+#       provider = "anthropic"        # or "openai" / "gemini"
+#       api_key  = "..."
+#       model    = "<model id>"       # required -- no default is guessed
+#       max_calls_per_session = 5     # optional (default 5)
+#
+# LLM output is an unverified estimate/recall, never a measurement; the UI says so.
+import json as _json
+import re as _re
+
+_LLM_PROMPT = (
+    "You are assisting with CNS drug-penetration triage. For the compound below, return ONLY a "
+    "JSON object (no prose, no code fences) with exactly these keys:\n"
+    '{"bbb_penetrant": "yes"|"no"|"unknown", "logBB": <number or null>, '
+    '"ppb_percent_bound": <number 0-100 or null>, "pgp_substrate": "yes"|"no"|"unknown", '
+    '"basis": "literature"|"estimate", "notes": "<max 25 words>"}\n'
+    "Use experimental/literature values when the compound is a known drug (basis=literature); "
+    "otherwise give your best structure-based estimate (basis=estimate). Use null/unknown rather "
+    "than guessing wildly.\n\nCompound name: {name}\nSMILES: {smiles}"
+)
+
+
+def _llm_config():
+    try:
+        cfg = dict(st.secrets.get("llm", {}))
+    except Exception:
+        cfg = {}
+    if cfg.get("provider") and cfg.get("api_key") and cfg.get("model"):
+        return cfg
+    return None
+
+
+def _parse_llm_json(text):
+    """Pull the first JSON object out of an LLM reply and normalise it. Returns dict or None."""
+    if not text:
+        return None
+    m = _re.search(r"\{.*\}", text, flags=_re.S)
+    if not m:
+        return None
+    try:
+        raw = _json.loads(m.group(0))
+    except Exception:
+        return None
+
+    def yn(v):
+        v = str(v).strip().lower()
+        return "Yes" if v in ("yes", "true", "y") else "No" if v in ("no", "false", "n") else ""
+
+    def num(v, lo=None, hi=None):
+        try:
+            x = float(v)
+        except Exception:
+            return None
+        if lo is not None and x < lo:
+            return None
+        if hi is not None and x > hi:
+            return None
+        return x
+
+    return {
+        "BBB penetrant": yn(raw.get("bbb_penetrant")),
+        "logBB": num(raw.get("logBB"), -4, 3),
+        "PPB % bound": num(raw.get("ppb_percent_bound"), 0, 100),
+        "P-gp substrate": yn(raw.get("pgp_substrate")),
+        "basis": str(raw.get("basis", ""))[:20],
+        "notes": str(raw.get("notes", ""))[:200],
+    }
+
+
+def call_llm(cfg, name, smiles):
+    """One request to the configured provider (plain HTTPS, no extra dependencies).
+    Returns (parsed_dict_or_None, error_message_or_None)."""
+    prompt = _LLM_PROMPT.replace("{name}", name or "(unnamed)").replace("{smiles}", smiles)
+    provider = str(cfg["provider"]).lower()
+    try:
+        if provider == "anthropic":
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": cfg["model"], "max_tokens": 400,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=40)
+            r.raise_for_status()
+            text = r.json()["content"][0]["text"]
+        elif provider == "openai":
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                json={"model": cfg["model"], "messages": [{"role": "user", "content": prompt}]},
+                timeout=40)
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
+        elif provider == "gemini":
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['model']}:generateContent",
+                headers={"x-goog-api-key": cfg["api_key"], "content-type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=40)
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            return None, f"Unknown LLM provider '{provider}' (use anthropic, openai or gemini)."
+    except Exception as e:
+        # never echo the key; status/code only
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return None, f"LLM request failed{f' (HTTP {code})' if code else ''}. Check the key/model in secrets."
+    parsed = _parse_llm_json(text)
+    if parsed is None:
+        return None, "The LLM reply could not be parsed as the expected JSON."
+    return parsed, None
+
+
+def _ours_row(res):
+    t1, abc, fu, lb = res["t1_pred"], res["abc"], res["t3_fu"], res["t2_logbb"]
+    return {
+        "BBB penetrant": ("Yes" if t1 == 1 else "No") if t1 is not None else "",
+        "logBB": round(lb, 2) if lb is not None else None,
+        "PPB % bound": round((1 - fu) * 100, 1) if fu is not None else None,
+        "P-gp substrate": ("Yes" if abc["efflux_liability"] >= 0.5 else "No") if abc is not None else "",
+    }
+
+
+def compare_flags(ours, other, label):
+    """Plain-language agreement/disagreement lines between our row and one external row."""
+    out = []
+    if ours["BBB penetrant"] and other.get("BBB penetrant"):
+        same = ours["BBB penetrant"] == other["BBB penetrant"]
+        out.append(f"{'✅' if same else '⚠'} **{label} — BBB:** {'agrees' if same else 'disagrees'} "
+                   f"(ours {ours['BBB penetrant']}, theirs {other['BBB penetrant']}).")
+    if ours["logBB"] is not None and other.get("logBB") is not None:
+        d = abs(ours["logBB"] - other["logBB"])
+        out.append(f"{'✅' if d <= 0.5 else '⚠'} **{label} — logBB:** differs by {d:.2f} "
+                   f"(ours {ours['logBB']:.2f}, theirs {other['logBB']:.2f}).")
+    if ours["PPB % bound"] is not None and other.get("PPB % bound") is not None:
+        d = abs(ours["PPB % bound"] - other["PPB % bound"])
+        out.append(f"{'✅' if d <= 15 else '⚠'} **{label} — PPB:** differs by {d:.0f} points "
+                   f"(ours {ours['PPB % bound']:.0f}%, theirs {other['PPB % bound']:.0f}%).")
+    if ours["P-gp substrate"] and other.get("P-gp substrate"):
+        same = ours["P-gp substrate"] == other["P-gp substrate"]
+        out.append(f"{'✅' if same else '⚠'} **{label} — efflux:** {'agrees' if same else 'disagrees'} "
+                   f"(ours {ours['P-gp substrate']}, theirs {other['P-gp substrate']}).")
+    return out
+
+
+def render_external_compare(res):
+    """Renders the comparison expander for the result currently held in session_state."""
+    key = res["smiles"]
+    store = st.session_state.setdefault("ext_compare", {})
+    entry = store.setdefault(key, {
+        "SwissADME": {"BBB penetrant": "", "logBB": None, "PPB % bound": None, "P-gp substrate": ""},
+        "ADMETlab 3.0": {"BBB penetrant": "", "logBB": None, "PPB % bound": None, "P-gp substrate": ""},
+        "LLM": None,
+    })
+    ours = _ours_row(res)
+
+    with st.expander("🔀 Compare with external predictions (SwissADME / ADMETlab / LLM)", expanded=False):
+        st.caption(
+            "Enter values from SwissADME or ADMETlab 3.0 (leave blank if unavailable) and, if enabled, "
+            "fetch an LLM estimate. Our output is shown alongside so you can see where tools agree "
+            "before building the Digital Twin. External values are not validated by this app."
+        )
+
+        # ── manual entry ──────────────────────────────────────────────────
+        base = pd.DataFrame(
+            [{"Source": s, **entry[s]} for s in ("SwissADME", "ADMETlab 3.0")]
+        )
+        for _c in ("logBB", "PPB % bound"):
+            base[_c] = pd.to_numeric(base[_c], errors="coerce")
+        edited = st.data_editor(
+            base, hide_index=True, use_container_width=True, key=f"ext_editor_{abs(hash(key))}",
+            disabled=["Source"],
+            column_config={
+                "BBB penetrant": st.column_config.SelectboxColumn("BBB penetrant", options=["", "Yes", "No"]),
+                "P-gp substrate": st.column_config.SelectboxColumn("P-gp substrate", options=["", "Yes", "No"]),
+                "logBB": st.column_config.NumberColumn("logBB", format="%.2f"),
+                "PPB % bound": st.column_config.NumberColumn("PPB % bound", min_value=0.0, max_value=100.0, format="%.1f"),
+            },
+        )
+        for _, row in edited.iterrows():
+            entry[row["Source"]] = {
+                "BBB penetrant": row["BBB penetrant"] or "",
+                "logBB": None if pd.isna(row["logBB"]) else float(row["logBB"]),
+                "PPB % bound": None if pd.isna(row["PPB % bound"]) else float(row["PPB % bound"]),
+                "P-gp substrate": row["P-gp substrate"] or "",
+            }
+
+        # ── optional LLM fetch ────────────────────────────────────────────
+        cfg = _llm_config()
+        if cfg is None:
+            st.caption("🤖 LLM estimate is not enabled on this deployment (needs an `[llm]` block in secrets).")
+        else:
+            cap = int(cfg.get("max_calls_per_session", 5))
+            used = st.session_state.get("llm_calls_used", 0)
+            st.caption(
+                f"🤖 LLM estimate via **{cfg['provider']}** — this sends the compound name/SMILES to that "
+                f"provider, so don't use it for unpublished structures. {cap - used} of {cap} calls left this session."
+            )
+            if st.button("Fetch LLM estimate", key=f"llm_btn_{abs(hash(key))}", disabled=used >= cap or entry["LLM"] is not None):
+                with st.spinner("Asking the LLM…"):
+                    parsed, err = call_llm(cfg, res["name"], res["smiles"])
+                st.session_state["llm_calls_used"] = used + 1
+                if err:
+                    st.error(err)
+                else:
+                    entry["LLM"] = parsed
+                    st.rerun()
+
+        ext = dict(entry)  # SwissADME / ADMETlab / LLM
+
+        # ── side-by-side table ────────────────────────────────────────────
+        rows = [{"Source": "This app (ours)", **ours}]
+        for s in ("SwissADME", "ADMETlab 3.0"):
+            if any(v not in ("", None) for v in ext[s].values()):
+                rows.append({"Source": s, **ext[s]})
+        if ext["LLM"]:
+            rows.append({"Source": "LLM (unverified)", **{k: ext["LLM"][k] for k in ours}})
+        table = pd.DataFrame(rows)
+        st.markdown("**Side-by-side**")
+        st.dataframe(table, hide_index=True, use_container_width=True)
+        if ext["LLM"] and ext["LLM"].get("notes"):
+            st.caption(f"LLM basis: {ext['LLM'].get('basis') or 'n/a'} · {ext['LLM']['notes']}")
+
+        # ── agreement flags ───────────────────────────────────────────────
+        flags = []
+        for s in ("SwissADME", "ADMETlab 3.0"):
+            flags += compare_flags(ours, ext[s], s)
+        if ext["LLM"]:
+            flags += compare_flags(ours, ext["LLM"], "LLM")
+        if flags:
+            st.markdown("**Agreement check**")
+            for f in flags:
+                st.markdown(f"- {f}")
+            st.caption("Agreement thresholds: logBB within 0.5, PPB within 15 points, same Yes/No calls. "
+                       "Our 'P-gp substrate' = efflux liability ≥ 0.5. Disagreement doesn't mean either tool is "
+                       "wrong — use it to decide what to check experimentally.")
+        elif len(rows) == 1:
+            st.info("Add external values above to see an agreement check.")
+
+        st.download_button("⬇ Download comparison (CSV)", table.to_csv(index=False).encode("utf-8"),
+                           file_name=f"comparison_{(res['name'] or 'compound')[:20].replace(' ', '_')}.csv",
+                           mime="text/csv", key=f"cmp_dl_{abs(hash(key))}")
+
+
+
 def confidence_bar(conf):
     pct = int(conf * 100)
     color = "#2ecc71" if conf >= 0.75 else "#f39c12" if conf >= 0.55 else "#e74c3c"
@@ -1343,10 +1604,14 @@ with tab1:
                     else:
                         overall = ("Overall: intrinsically permeable, but efflux is the main expected limiter of "
                                    f"brain exposure (~{(1 - ratio) * 100:.0f}% lower Kp).")
+                elif liab >= 0.3 and decision["efflux"].intervention_required:
+                    overall = ("Overall: unfavourable — passive permeability is limited, and efflux "
+                               f"(liability {liab:.2f}) lowers brain Kp further "
+                               f"({res['predicted_kp']:.3f} → {res['final_kp']:.3f}).")
                 elif liab >= 0.3:
                     overall = ("Overall: unfavourable — brain entry is limited by low passive permeability. "
-                               "Efflux liability is high, but the Decision Layer treats its additional effect "
-                               "as negligible when passive permeability is already this low.")
+                               f"Efflux liability is {lvl} ({liab:.2f}), but the Decision Layer treats its "
+                               "additional effect as negligible when passive permeability is already this low.")
                 else:
                     overall = "Overall: limited by low passive permeability rather than efflux."
                 if t3_fu is not None and t3_fu < 0.05:
@@ -1356,6 +1621,14 @@ with tab1:
 
         # ═════════════════════════ BASIC ═════════════════════════
         if t1_mode == "Basic":
+            st.warning(
+                "Research beta — predictions are for prioritisation, not decisions. Plasma binding is "
+                "compressed toward the middle (very high binders under-predicted, very low binders "
+                "over-predicted). See **Advanced → blind spots** for the full list."
+            )
+            if matched:
+                st.info(f"Matched to validated calibration compound **{matched}**: stored notebook "
+                        "values are used for the Decision Layer, so this is not an independent model test.")
             st.markdown("### 1 · Passive transport")
             if decision is not None:
                 c1, c2, c3 = st.columns(3)
@@ -1474,17 +1747,17 @@ with tab1:
             if res["papp_plasma"] is not None:
                 st.markdown("### Digital Twin — Papp Estimate (Sugano-prior view)")
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Papp (plasma)", f"{res['papp_plasma']:.2f} ×10⁻⁶ cm/s")
-                c2.metric("Papp (serum-free)", f"{res['papp_free']:.2f} ×10⁻⁶ cm/s")
+                c1.metric("Papp index (plasma)", f"{res['papp_plasma']:.2f}")
+                c2.metric("Papp index (serum-free)", f"{res['papp_free']:.2f}")
                 c3.metric("Efflux ratio", f"{res['efflux_ratio']:.1f}×")
                 st.caption(
                     "Formula: Papp,free = 10^((logBB − β) / α)  ·  "
                     "Papp,plasma = Papp,free × fu_plasma / efflux_ratio  "
                     "(α=1.99, β=0.357; Sugano 2010 priors — pending on-chip calibration). "
                     "This is a separate, older mechanistic view; the Decision Layer's Final Kp above "
-                    "is the current frozen-architecture output. ⚠ Absolute Papp magnitudes are "
-                    "unit-unverified (values can come out implausibly large) — use for relative "
-                    "ranking only until calibrated."
+                    "is the current frozen-architecture output. ⚠ These are relative indices, not "
+                    "calibrated permeabilities — the absolute scale and units are unverified, so use "
+                    "them for ranking compounds only."
                 )
 
             st.markdown("### Conclusion")
@@ -1524,7 +1797,8 @@ with tab1:
                     "Tier 1 is a consensus classifier, Tier 2 a stacked logBB regressor, "
                     "Tier 3 a plasma fu regressor.\n"
                     "- **Efflux** is an RF + XGBoost soft-vote over P-gp/BCRP/MRP substrate labels; "
-                    "liability = P(Substrate) + P(Both).\n"
+                    "liability = P(Substrate) + P(Both). Input layout (Morgan bits first) confirmed "
+                    "against the model metadata and the notebook's stored liabilities.\n"
                     "- **Decision Layer v2** converts the digital-twin Kp into `rel_passive` "
                     f"(Hill function, Kd={EFFLUX_KD}, n={EFFLUX_N}) and only applies an efflux "
                     f"correction when passive permeability and transporter evidence both clear "
@@ -1546,7 +1820,7 @@ with tab1:
                     "method and concentration also vary across the literature it was trained on.\n"
                     "- **Efflux is a substrate classifier**, not a transport-rate predictor. It does not "
                     "capture transporter expression levels, saturation, or inhibition/drug–drug "
-                    "interactions.\n"
+                    "interactions. Its labels also mix substrates and inhibitors.\n"
                     "- **Uptake is not predicted.** The uptake agent fires only on curated literature "
                     "evidence you supply; carrier-mediated brain entry (e.g. LAT1, OATP) is otherwise "
                     "invisible to the model.\n"
@@ -1563,6 +1837,8 @@ with tab1:
                     "should be confirmed with in vitro (chip) or in vivo data."
                 )
 
+
+        render_external_compare(res)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — BATCH SCREENING
