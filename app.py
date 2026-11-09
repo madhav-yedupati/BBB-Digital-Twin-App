@@ -1306,16 +1306,40 @@ def fetch_admetlab(smiles: str, timeout: int = 30):
         return None, "No SMILES to send.", ()
 
     last_err = None
-    # Their single- and batch-prediction paths have both been in use; try both
-    # rather than pinning one that may move.
-    for path, payload in (
-        ("/api/single/admet", {"smiles": smiles}),
-        ("/api/admet", {"smiles": [smiles]}),
-    ):
+    # Documented spec (admetlab3.scbdd.com/apis/): POST /api/admet with a
+    # payload keyed "SMILES" (UPPERCASE -- lowercase is not accepted), whose
+    # value is a SMILES string or a list of them.
+    for payload in ({"SMILES": smiles}, {"SMILES": [smiles]}):
         try:
-            r = requests.post(f"{_ADMETLAB_BASE}{path}", json=payload, timeout=timeout)
+            r = requests.post(f"{_ADMETLAB_BASE}/api/admet", json=payload, timeout=timeout)
+            if r.status_code == 404:
+                # Verified Nov 2026: /api/admet returns 404 from the application
+                # while /api/molsvg returns 429, i.e. the server is routing but
+                # the ADMET endpoints are not registered. Their docs carry a
+                # banner about sustained attacks on their infrastructure.
+                return None, (
+                    "ADMETlab's prediction API is currently unavailable (HTTP 404 on their "
+                    "documented /api/admet endpoint). Their site reports ongoing server "
+                    "problems. This is on their end — enter values by hand for now, or use "
+                    "the web form at admetlab3.scbdd.com."
+                ), ()
+            if r.status_code == 429:
+                return None, (
+                    "ADMETlab rate-limited the request (HTTP 429). Their policy is max 5 "
+                    "requests/second — wait a moment and try again."
+                ), ()
             r.raise_for_status()
-            flat = _flatten_scalars(r.json())
+            body = r.json()
+            # Documented shape: {"status","code","data":{"taskid",...,"data":[{...}],
+            # "explanation":{...}}}. Prefer the per-molecule record so the
+            # "explanation" block (prose keyed by the same property names) can't
+            # shadow real values.
+            record = None
+            try:
+                record = body["data"]["data"][0]
+            except (KeyError, IndexError, TypeError):
+                record = None
+            flat = _flatten_scalars(record if record is not None else body)
             if not flat:
                 last_err = "ADMETlab returned an empty response."
                 continue
