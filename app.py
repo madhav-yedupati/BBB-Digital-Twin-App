@@ -1194,6 +1194,77 @@ def call_llm(cfg, name, smiles):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BOILED-EGG  (local reimplementation of the published model)
+# ══════════════════════════════════════════════════════════════════════════════
+# SwissADME has no API, and its "BBB permeant" call IS the BOILED-Egg model, which
+# is fully published -- so we compute it here rather than asking the user to copy
+# it across by hand.
+#
+# Parameters are taken from the primary source, NOT from any third-party code:
+#   Daina A, Zoete V. "A BOILED-Egg To Predict Gastrointestinal Absorption and
+#   Brain Penetration of Small Molecules." ChemMedChem 2016;11(11):1117-1121.
+#   doi:10.1002/cmdc.201600182 -- Supporting Information, Figures S1 and S2.
+# (Deliberately not derived from pyBOILEDegg, which is GPL-v3 and would be
+#  incompatible with this repo's MIT licence.)
+#
+# ⚠ THE ANGLE IS IN DEGREES, not radians. The SI writes "-1.031325°". Treating it
+# as radians rotates the ellipse by ~59° and produces wrong calls. Verified: with
+# degrees, the implied extents reproduce the SI's own stated ranges -- BBB tPSA
+# -2.9..79.1 and WLOGP 0.4..6.0; HIA tPSA 0.0..142.1.
+#
+# Note "length of major/minor axis" in the SI are FULL axis lengths, so the
+# semi-axes used in the membership test are half those values.
+_BOILED_EGG = {
+    # region: (centre_tpsa, centre_wlogp, major_axis, minor_axis, angle_degrees)
+    "HIA": (71.051, 2.292, 142.081, 8.740, -1.031325),   # "white"  -- GI absorption
+    "BBB": (38.117, 3.177,  82.061, 5.557, -0.171887),   # "yolk"   -- brain penetration
+}
+_BOILED_EGG_CITATION = (
+    "Daina & Zoete, ChemMedChem 2016;11(11):1117-1121 (doi:10.1002/cmdc.201600182), "
+    "Supporting Information Figures S1/S2"
+)
+
+
+def _in_boiled_egg_region(tpsa, wlogp, region):
+    """Point-in-ellipse test in (tPSA, WLOGP) space for one BOILED-Egg region."""
+    import math as _math
+    cx, cy, major, minor, angle_deg = _BOILED_EGG[region]
+    a, b = major / 2.0, minor / 2.0
+    th = _math.radians(angle_deg)
+    dx, dy = tpsa - cx, wlogp - cy
+    xp = dx * _math.cos(th) + dy * _math.sin(th)
+    yp = -dx * _math.sin(th) + dy * _math.cos(th)
+    return (xp / a) ** 2 + (yp / b) ** 2 <= 1.0
+
+
+def boiled_egg(smiles):
+    """Classify one SMILES against the BOILED-Egg model.
+
+    Returns {"bbb","gi","tpsa","wlogp"} or None if the SMILES can't be parsed.
+
+    TPSA is computed with includeSandP=True to follow Ertl et al. (2000), which is
+    what SwissADME states it uses. NOTE this differs from the app's own TPSA column
+    (PHYSCHEM_DESCS -> Descriptors.TPSA, S and P excluded) for sulfur- or
+    phosphorus-containing compounds; that is intentional, so this row reproduces
+    SwissADME rather than our internal descriptor set.
+    """
+    mol = mol_from_smiles(smiles)
+    if mol is None:
+        return None
+    try:
+        tpsa = Descriptors.TPSA(mol, includeSandP=True)
+    except TypeError:          # very old RDKit without the kwarg
+        tpsa = Descriptors.TPSA(mol)
+    wlogp = Descriptors.MolLogP(mol)      # Wildman-Crippen == WLOGP
+    return {
+        "bbb": _in_boiled_egg_region(tpsa, wlogp, "BBB"),
+        "gi": _in_boiled_egg_region(tpsa, wlogp, "HIA"),
+        "tpsa": round(tpsa, 2),
+        "wlogp": round(wlogp, 4),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMETlab 3.0 AUTO-FETCH
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMETlab 3.0 (Fu et al., Nucleic Acids Res 2024, 52(W1):W422-W431) added a
@@ -1431,11 +1502,21 @@ def render_external_compare(res):
 
     with st.expander("🔀 Compare with external predictions (SwissADME / ADMETlab / LLM)", expanded=False):
         st.caption(
-            "**ADMETlab 3.0 fetches automatically** (free public API, no key). **SwissADME has no API**, "
-            "so its row stays manual — paste values from swissadme.ch if you want them compared. "
-            "Our output is shown alongside so you can see where tools agree before building the Digital "
-            "Twin. External values are not validated by this app."
+            "**BOILED-Egg is computed locally** — no network, always available. It is our own "
+            "implementation of the published model behind SwissADME's BBB call "
+            f"({_BOILED_EGG_CITATION}), not SwissADME output, and it speaks only to BBB/GI. "
+            "**ADMETlab 3.0 fetches automatically** (free public API, no key). **SwissADME itself has "
+            "no API**, so its row stays manual — paste values from swissadme.ch if you want them "
+            "compared. External values are not validated by this app."
         )
+        _egg = boiled_egg(res["smiles"])
+        if _egg:
+            st.caption(
+                f"BOILED-Egg inputs — WLOGP **{_egg['wlogp']:.2f}**, "
+                f"TPSA **{_egg['tpsa']:.2f} Å²** (Ertl, S and P included) → "
+                f"BBB **{'permeant' if _egg['bbb'] else 'non-permeant'}**, "
+                f"GI absorption **{'high' if _egg['gi'] else 'low'}**."
+            )
 
         # ── ADMETlab auto-fetch ───────────────────────────────────────────
         col_fetch, col_status = st.columns([1, 3])
@@ -1524,8 +1605,23 @@ def render_external_compare(res):
 
         ext = dict(entry)  # SwissADME / ADMETlab / LLM
 
+        # ── BOILED-Egg (computed locally, no network) ─────────────────────
+        # This is the same published model behind SwissADME's "BBB permeant" call,
+        # but it is OUR implementation of it -- labelled as such, never as
+        # SwissADME output. It only speaks to BBB/GI; the other columns stay blank.
+        egg_row = None
+        if _egg:
+            egg_row = {
+                "BBB penetrant": "Yes" if _egg["bbb"] else "No",
+                "logBB": None,
+                "PPB % bound": None,
+                "P-gp substrate": "",
+            }
+
         # ── side-by-side table ────────────────────────────────────────────
         rows = [{"Source": "This app (ours)", **ours}]
+        if egg_row:
+            rows.append({"Source": "BOILED-Egg (local)", **egg_row})
         for s in ("SwissADME", "ADMETlab 3.0"):
             if any(v not in ("", None) for v in ext[s].values()):
                 rows.append({"Source": s, **ext[s]})
@@ -1539,6 +1635,8 @@ def render_external_compare(res):
 
         # ── agreement flags ───────────────────────────────────────────────
         flags = []
+        if egg_row:
+            flags += compare_flags(ours, egg_row, "BOILED-Egg")
         for s in ("SwissADME", "ADMETlab 3.0"):
             flags += compare_flags(ours, ext[s], s)
         if ext["LLM"]:
