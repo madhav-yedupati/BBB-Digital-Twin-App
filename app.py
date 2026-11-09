@@ -1074,8 +1074,9 @@ def decision_card(mechanism_label, mech):
 # ══════════════════════════════════════════════════════════════════════════════
 # EXTERNAL / LLM COMPARISON PANEL
 # ══════════════════════════════════════════════════════════════════════════════
-# Side-by-side view of our predictions vs. external tools (SwissADME, ADMETlab 3.0,
-# entered by hand -- neither offers a stable free API) and an optional LLM estimate.
+# Side-by-side view of our predictions vs. external tools and an optional LLM
+# estimate. ADMETlab 3.0 is fetched automatically via its free public API (see
+# fetch_admetlab below); SwissADME has no API and stays manual-entry.
 #
 # The LLM fetch is OFF unless an [llm] block exists in Streamlit secrets:
 #
@@ -1192,6 +1193,175 @@ def call_llm(cfg, name, smiles):
     return parsed, None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMETlab 3.0 AUTO-FETCH
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMETlab 3.0 (Fu et al., Nucleic Acids Res 2024, 52(W1):W422-W431) added a
+# free public API -- no registration, no key. We use it to auto-populate the
+# ADMETlab row of the comparison panel instead of making the user copy values
+# across by hand.
+#
+# SwissADME has NO API (web form only), so its row stays manual. Do not add a
+# scraper here: it is brittle, it would hang this app whenever the SIB server is
+# slow, and it is not clearly permitted by their terms.
+#
+# ── IF THE MAPPING BREAKS ─────────────────────────────────────────────────────
+# ADMETlab's JSON key names are not contractually stable. Rather than hard-fail,
+# we search the response for any of several candidate key names per field and,
+# if a field can't be found, the UI shows the raw keys that *were* returned so
+# the mapping below can be corrected in one line. Check the live spec at
+# https://admetlab3.scbdd.com/apis/ if you need to re-map.
+_ADMETLAB_BASE = "https://admetlab3.scbdd.com"
+
+_ADMETLAB_KEYS = {
+    # our column        candidate keys in the ADMETlab response (case-insensitive)
+    "BBB penetrant":  ("bbb", "bbb_penetration", "logbb_class"),
+    "logBB":          ("logbb", "log_bb"),
+    "PPB % bound":    ("ppb", "plasma_protein_binding"),
+    "P-gp substrate": ("pgp-sub", "pgp_sub", "pgpsub", "pgp_substrate"),
+}
+
+
+def _flatten_scalars(obj, out=None):
+    """Collect every scalar leaf in a nested JSON structure, keyed by lowercased key name.
+
+    ADMETlab may return {"data": {"BBB": 0.9}}, [{"BBB": 0.9}], or {"BBB": {"value": 0.9}}.
+    Flattening sidesteps having to guess which shape we got. First occurrence wins.
+    """
+    if out is None:
+        out = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).strip().lower()
+            if isinstance(v, (int, float, str)) and kl not in out:
+                out[kl] = v
+            elif isinstance(v, dict) and "value" in v and kl not in out:
+                out[kl] = v["value"]
+            else:
+                _flatten_scalars(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _flatten_scalars(v, out)
+    return out
+
+
+def _admetlab_normalise(flat):
+    """Map flattened ADMETlab values onto our 4 comparison columns.
+
+    Returns (row_dict, missing_field_names). Classification endpoints come back as
+    probabilities in [0, 1]; we threshold at 0.5 to match how our own row is built
+    (see _ours_row, which uses efflux_liability >= 0.5).
+    """
+    row, missing = {}, []
+
+    def first_hit(candidates):
+        for c in candidates:
+            if c in flat:
+                return flat[c]
+        return None
+
+    def as_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    # --- classification endpoints: probability -> Yes/No -----------------
+    for col in ("BBB penetrant", "P-gp substrate"):
+        v = as_float(first_hit(_ADMETLAB_KEYS[col]))
+        if v is None:
+            row[col], _ = "", missing.append(col)
+        else:
+            row[col] = "Yes" if v >= 0.5 else "No"
+
+    # --- logBB: regression, use as-is ------------------------------------
+    v = as_float(first_hit(_ADMETLAB_KEYS["logBB"]))
+    row["logBB"] = round(v, 2) if v is not None else None
+    if v is None:
+        missing.append("logBB")
+
+    # --- PPB: may be a percentage (0-100) or a fraction (0-1) ------------
+    v = as_float(first_hit(_ADMETLAB_KEYS["PPB % bound"]))
+    if v is None:
+        row["PPB % bound"], _ = None, missing.append("PPB % bound")
+    else:
+        row["PPB % bound"] = round(v * 100 if v <= 1.0 else v, 1)
+
+    return row, missing
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=256)
+def fetch_admetlab(smiles: str, timeout: int = 30):
+    """Fetch ADMETlab 3.0 predictions for one SMILES.
+
+    Returns (row, error, raw_keys):
+      row       -- dict matching our comparison columns, or None on failure
+      error     -- user-facing message, or None on success
+      raw_keys  -- sorted key names seen in the response (for re-mapping when
+                   a field is missing); empty tuple on failure.
+
+    Cached for an hour so re-running a compound doesn't re-hit their server.
+    """
+    if not smiles:
+        return None, "No SMILES to send.", ()
+
+    last_err = None
+    # Their single- and batch-prediction paths have both been in use; try both
+    # rather than pinning one that may move.
+    for path, payload in (
+        ("/api/single/admet", {"smiles": smiles}),
+        ("/api/admet", {"smiles": [smiles]}),
+    ):
+        try:
+            r = requests.post(f"{_ADMETLAB_BASE}{path}", json=payload, timeout=timeout)
+            r.raise_for_status()
+            flat = _flatten_scalars(r.json())
+            if not flat:
+                last_err = "ADMETlab returned an empty response."
+                continue
+            row, missing = _admetlab_normalise(flat)
+            if len(missing) == 4:
+                # Reached the server but recognised nothing -- almost certainly
+                # a key-name change rather than a transport problem.
+                return None, (
+                    "Reached ADMETlab, but none of the expected fields were found in the "
+                    "response — their key names have probably changed. See the raw keys below "
+                    "and update _ADMETLAB_KEYS."
+                ), tuple(sorted(flat))
+            return row, None, tuple(sorted(flat))
+        except requests.exceptions.Timeout:
+            last_err = f"ADMETlab timed out after {timeout}s. Their server may be busy — try again."
+        except requests.exceptions.RequestException as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            last_err = f"Could not reach ADMETlab{f' (HTTP {code})' if code else ''}."
+        except ValueError:
+            last_err = "ADMETlab's reply was not valid JSON."
+
+    return None, last_err or "ADMETlab request failed.", ()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLISHED REFERENCE COMPOUNDS
+# ══════════════════════════════════════════════════════════════════════════════
+# Loaded from reference_compounds.json so the lab can add entries without touching
+# code. JSON rather than YAML deliberately: stdlib only, no new pinned dependency.
+_REF_COMPOUNDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "reference_compounds.json")
+
+
+@st.cache_data(show_spinner=False)
+def load_reference_compounds():
+    """Returns (compounds_list, sources_dict, error_or_None)."""
+    try:
+        with open(_REF_COMPOUNDS_FILE, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh)
+    except FileNotFoundError:
+        return [], {}, "reference_compounds.json not found next to app.py."
+    except ValueError as e:
+        return [], {}, f"reference_compounds.json is not valid JSON ({e})."
+    return doc.get("compounds", []), doc.get("sources", {}), None
+
+
 def _ours_row(res):
     t1, abc, fu, lb = res["t1_pred"], res["abc"], res["t3_fu"], res["t2_logbb"]
     return {
@@ -1237,10 +1407,49 @@ def render_external_compare(res):
 
     with st.expander("🔀 Compare with external predictions (SwissADME / ADMETlab / LLM)", expanded=False):
         st.caption(
-            "Enter values from SwissADME or ADMETlab 3.0 (leave blank if unavailable) and, if enabled, "
-            "fetch an LLM estimate. Our output is shown alongside so you can see where tools agree "
-            "before building the Digital Twin. External values are not validated by this app."
+            "**ADMETlab 3.0 fetches automatically** (free public API, no key). **SwissADME has no API**, "
+            "so its row stays manual — paste values from swissadme.ch if you want them compared. "
+            "Our output is shown alongside so you can see where tools agree before building the Digital "
+            "Twin. External values are not validated by this app."
         )
+
+        # ── ADMETlab auto-fetch ───────────────────────────────────────────
+        col_fetch, col_status = st.columns([1, 3])
+        with col_fetch:
+            do_fetch = st.button(
+                "⬇ Fetch from ADMETlab 3.0",
+                key=f"admet_btn_{abs(hash(key))}",
+                use_container_width=True,
+            )
+        if do_fetch:
+            with st.spinner("Querying ADMETlab 3.0…"):
+                row, err, raw_keys = fetch_admetlab(res["smiles"])
+            if err:
+                st.session_state[f"admet_err_{key}"] = err
+                st.session_state[f"admet_keys_{key}"] = raw_keys
+            else:
+                entry["ADMETlab 3.0"] = row
+                st.session_state.pop(f"admet_err_{key}", None)
+                st.session_state[f"admet_keys_{key}"] = raw_keys
+                # Bump the editor's widget key. st.data_editor keeps its own edit
+                # state against a fixed key and re-applies it over new data, which
+                # would silently discard what we just fetched.
+                st.session_state[f"ext_editor_ver_{key}"] = (
+                    st.session_state.get(f"ext_editor_ver_{key}", 0) + 1
+                )
+                st.rerun()
+
+        _err = st.session_state.get(f"admet_err_{key}")
+        if _err:
+            with col_status:
+                st.warning(f"{_err} You can still enter values by hand below.")
+            _keys = st.session_state.get(f"admet_keys_{key}") or ()
+            if _keys:
+                with st.expander("Raw keys returned by ADMETlab (for re-mapping)", expanded=False):
+                    st.code(", ".join(_keys), language=None)
+        elif any(v not in ("", None) for v in entry["ADMETlab 3.0"].values()):
+            with col_status:
+                st.success("ADMETlab 3.0 values loaded — shown in the table below, editable.")
 
         # ── manual entry ──────────────────────────────────────────────────
         base = pd.DataFrame(
@@ -1248,8 +1457,10 @@ def render_external_compare(res):
         )
         for _c in ("logBB", "PPB % bound"):
             base[_c] = pd.to_numeric(base[_c], errors="coerce")
+        _ed_ver = st.session_state.get(f"ext_editor_ver_{key}", 0)
         edited = st.data_editor(
-            base, hide_index=True, use_container_width=True, key=f"ext_editor_{abs(hash(key))}",
+            base, hide_index=True, use_container_width=True,
+            key=f"ext_editor_{abs(hash(key))}_{_ed_ver}",
             disabled=["Source"],
             column_config={
                 "BBB penetrant": st.column_config.SelectboxColumn("BBB penetrant", options=["", "Yes", "No"]),
@@ -1745,19 +1956,9 @@ with tab1:
                 decision_card("Uptake", decision["uptake"])
 
             if res["papp_plasma"] is not None:
-                st.markdown("### Digital Twin — Papp Estimate (Sugano-prior view)")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Papp index (plasma)", f"{res['papp_plasma']:.2f}")
-                c2.metric("Papp index (serum-free)", f"{res['papp_free']:.2f}")
-                c3.metric("Efflux ratio", f"{res['efflux_ratio']:.1f}×")
-                st.caption(
-                    "Formula: Papp,free = 10^((logBB − β) / α)  ·  "
-                    "Papp,plasma = Papp,free × fu_plasma / efflux_ratio  "
-                    "(α=1.99, β=0.357; Sugano 2010 priors — pending on-chip calibration). "
-                    "This is a separate, older mechanistic view; the Decision Layer's Final Kp above "
-                    "is the current frozen-architecture output. ⚠ These are relative indices, not "
-                    "calibrated permeabilities — the absolute scale and units are unverified, so use "
-                    "them for ranking compounds only."
+                st.info(
+                    "ℹ The permeability-index view for this compound has moved to the "
+                    "**🔗 Digital Twin** tab, alongside the Papp ↔ logBB calculator."
                 )
 
             st.markdown("### Conclusion")
@@ -1804,8 +2005,10 @@ with tab1:
                     f"correction when passive permeability and transporter evidence both clear "
                     f"the {EFFLUX_THRESHOLD} gate. Uptake corrections require curated literature "
                     "evidence — they never come from an ML guess.\n"
-                    "- **Papp** uses Sugano-style priors (α=1.99, β=0.357) and is not yet calibrated "
-                    "to on-chip measurements."
+                    "- **Permeability index** (🔗 Digital Twin tab) uses Sugano-style priors "
+                    "(α=1.99, β=0.357), is not calibrated to on-chip measurements, and is a monotone "
+                    "re-expression of logBB — it ranks compounds identically to Tier 2 and adds no "
+                    "information beyond it."
                 )
             with st.expander("⚠ Potential blind spots of this analysis", expanded=True):
                 st.markdown(
@@ -1955,10 +2158,153 @@ with tab2:
 # TAB 3 — DIGITAL TWIN
 # ══════════════════════════════════════════════════════════════════════════════
 with tab3:
-    st.subheader("Digital Twin — Papp ↔ logBB Calculator")
+    # ── Relocated from the Single Compound tab (Nov 2026) ─────────────────────
+    # Riccardo's feedback: "the digital twin prediction is interesting but I do not
+    # fully understand what model is based on. It may be best if this prediction was
+    # provided under the Digital Twin tab." Moved here, and relabelled -- it was
+    # previously shown as "Papp index" with values in the 10^5-10^6 range, which read
+    # as a permeability in x10^-6 cm/s and is ~3-6 orders of magnitude above anything
+    # physically measurable. It is a ranking index, so it is now presented as one.
+    _tw_res = st.session_state.get("t1_res")
+
+    st.subheader("Permeability Ranking Index — current compound")
+
+    if not _tw_res or _tw_res.get("papp_plasma") is None:
+        st.info(
+            "Run a compound in the **🔬 Single Compound** tab and its permeability index "
+            "will appear here."
+        )
+    else:
+        st.caption(f"Showing: **{_tw_res.get('name') or 'unnamed compound'}**")
+        _c1, _c2, _c3 = st.columns(3)
+        _c1.metric("Index (plasma)", f"{_tw_res['papp_plasma']:,.0f}")
+        _c2.metric("Index (serum-free)", f"{_tw_res['papp_free']:,.0f}")
+        _c3.metric("Efflux ratio", f"{_tw_res['efflux_ratio']:.1f}×")
+
+        st.warning(
+            "**Ranking only — this is not a permeability, and not a separate model.** "
+            "The index is a monotone re-expression of the Tier-2 logBB prediction with plasma "
+            "free fraction and efflux ratio folded in. Holding fu and efflux ratio constant, it "
+            "orders compounds *identically* to logBB — it adds no information beyond Tier 2. "
+            "The numbers are unitless and have no calibrated scale; do not report them as "
+            "cm/s or compare them against measured Papp values."
+        )
+
+        with st.expander("What this is based on", expanded=False):
+            st.markdown(
+                """
+**Formula**
+
+```
+Papp,free   = 10^((logBB − β) / α)
+Papp,plasma = Papp,free × fu_plasma / efflux_ratio
+```
+
+**Where the inputs come from**
+
+| Input | Source |
+|---|---|
+| `logBB` | Tier 2 stacked regressor (this app) |
+| `fu_plasma` | Tier 3 plasma-protein-binding model (this app) |
+| `efflux_ratio` | ABC transporter model (this app) |
+| `α = 1.99`, `β = 0.357` | Literature priors (Sugano 2010) — **assumed, not fitted to any data in this app** |
+
+**Status**
+
+- α and β are **priors, not calibrated parameters**. Nothing in this app has been fitted
+  to on-chip permeability.
+- The relation is flat: across the whole physiological logBB range (−2 to +1) the index
+  spans only ~32×, whereas measured BBB/Caco-2 Papp spans ~10⁴×. It therefore cannot
+  reproduce the dynamic range of a real permeability assay.
+- Pending calibration against Charles's on-chip Papp measurements (Figure 4,
+  APL Bioengineering submission). Until then, treat it strictly as a ranking.
+
+**This is not the pipeline's output.** The frozen architecture ends at the Decision
+Layer's Final Kp, shown in the Single Compound tab. This panel is an older mechanistic
+view kept for comparison.
+                """
+            )
+
+    # ── Published reference compounds ────────────────────────────────────────
+    # Riccardo's feedback: "add a simple menu to select a few models based on data of
+    # existing papers so that people can use this menu for simply testing hypothesis
+    # using published data."
+    st.markdown("---")
+    st.subheader("Published Reference Compounds")
+
+    _refs, _ref_sources, _ref_err = load_reference_compounds()
+    if _ref_err:
+        st.error(f"Could not load reference compounds: {_ref_err}")
+    elif not _refs:
+        st.info("No reference compounds defined yet. Add entries to `reference_compounds.json`.")
+    else:
+        st.caption(
+            "Pick a compound measured in a published study to compare its reported value "
+            "against this app's prediction. Entries live in `reference_compounds.json` — "
+            "add more without changing any code."
+        )
+
+        _names = [c["name"] for c in _refs]
+        _pick = st.selectbox("Compound", _names, key="ref_compound_pick")
+        _rec = next(c for c in _refs if c["name"] == _pick)
+        _src = _ref_sources.get(_rec.get("source"), {})
+
+        # Agreement on a compound the model was calibrated on is not evidence the
+        # model generalises. Say so before showing the numbers, not after.
+        if _src.get("in_calibration_set"):
+            st.error(
+                "⚠ **This compound is in the model's own calibration set.** The Decision "
+                "Layer's Bayesian agents were fitted against these same measured values, so "
+                "agreement below is circular — it shows the pipeline runs, **not** that it "
+                "generalises. A genuine test needs chip-measured compounds outside this set."
+            )
+
+        _m, _p = _rec.get("measured_kp"), _rec.get("model_dt_pred")
+        _k1, _k2, _k3 = st.columns(3)
+        _k1.metric("Published Kp (measured)", f"{_m:.4f}" if _m is not None else "—")
+        _k2.metric("Model Kp (DT alone)", f"{_p:.4f}" if _p is not None else "—")
+        if _m and _p:
+            _fold = max(_m, _p) / min(_m, _p)
+            _k3.metric("Fold difference", f"{_fold:.2f}×",
+                       delta=f"{'over' if _p > _m else 'under'}-predicted",
+                       delta_color="off")
+
+        _d1, _d2, _d3 = st.columns(3)
+        _d1.metric("Efflux liability", f"{_rec.get('efflux_liability', float('nan')):.3f}")
+        _d2.metric("WLOGP", f"{_rec.get('logp_wildman_crippen', float('nan')):.2f}")
+        _d3.metric("TPSA", f"{_rec.get('tpsa', float('nan')):.2f} Å²")
+
+        if _src:
+            st.caption(
+                f"**Source:** {_src.get('citation', 'n/a')}"
+                + (f" · DOI [{_src['doi']}](https://doi.org/{_src['doi']})" if _src.get("doi") else "")
+                + (f"  \n**Assay:** {_src['assay']}" if _src.get("assay") else "")
+            )
+
+        with st.expander("Show all reference compounds", expanded=False):
+            _tbl = pd.DataFrame([{
+                "Compound": c["name"],
+                "Published Kp": c.get("measured_kp"),
+                "Model Kp": c.get("model_dt_pred"),
+                "Efflux liability": c.get("efflux_liability"),
+                "WLOGP": c.get("logp_wildman_crippen"),
+                "TPSA": c.get("tpsa"),
+                "Source": _ref_sources.get(c.get("source"), {}).get("citation", c.get("source", "")),
+            } for c in _refs])
+            st.dataframe(_tbl, hide_index=True, use_container_width=True)
+            st.download_button(
+                "⬇ Download reference set (CSV)",
+                _tbl.to_csv(index=False).encode("utf-8"),
+                file_name="reference_compounds.csv", mime="text/csv",
+                key="ref_dl",
+            )
+
+    st.markdown("---")
+    st.subheader("Papp ↔ logBB Calculator")
     st.markdown(
         "Mechanistic formula linking model predictions to on-chip Papp measurements. "
-        "Calibrated from Sugano 2010 priors; will be updated with Bae et al. on-chip data."
+        "Uses the same Sugano 2010 priors as the index above — **uncalibrated**; "
+        "will be updated with Bae et al. on-chip data."
     )
 
     direction = st.radio(

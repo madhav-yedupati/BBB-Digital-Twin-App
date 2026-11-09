@@ -1,0 +1,103 @@
+{
+  "_comment": "Published reference compounds for hypothesis testing in the Digital Twin tab. Values are lifted verbatim from _CALIBRATION_DATA in app.py, which in turn comes from Table 3 of the source paper. Add new entries here -- no code change needed. IMPORTANT: every compound in this seed set is part of the model's own calibration set, so agreement between prediction and measurement is NOT independent validation.",
+  "sources": {
+    "bae2024": {
+      "citation": "Yang, Shin, Jeong, Bae et al., Pharmaceutics 2024, 16(5), 574",
+      "doi": "10.3390/pharmaceutics16050574",
+      "assay": "Human BBB-on-a-chip; Kp = brain-side:vascular-side partition coefficient",
+      "in_calibration_set": true
+    }
+  },
+  "compounds": [
+    {
+      "name": "Donepezil",
+      "source": "bae2024",
+      "measured_kp": 0.4794,
+      "model_dt_pred": 0.134756,
+      "efflux_liability": 0.106323,
+      "logp_wildman_crippen": 4.3611,
+      "tpsa": 38.77
+    },
+    {
+      "name": "Loperamide",
+      "source": "bae2024",
+      "measured_kp": 0.0552,
+      "model_dt_pred": 0.156663,
+      "efflux_liability": 0.915715,
+      "logp_wildman_crippen": 5.088,
+      "tpsa": 43.78
+    },
+    {
+      "name": "Caffeine",
+      "source": "bae2024",
+      "measured_kp": 0.4349,
+      "model_dt_pred": 0.533124,
+      "efflux_liability": 0.669177,
+      "logp_wildman_crippen": -1.0293,
+      "tpsa": 61.82
+    },
+    {
+      "name": "Nefazodone",
+      "source": "bae2024",
+      "measured_kp": 0.0953,
+      "model_dt_pred": 0.176294,
+      "efflux_liability": 0.087304,
+      "logp_wildman_crippen": 3.5519,
+      "tpsa": 55.53
+    },
+    {
+      "name": "Carbamazepine",
+      "source": "bae2024",
+      "measured_kp": 0.2823,
+      "model_dt_pred": 0.204523,
+      "efflux_liability": 0.433281,
+      "logp_wildman_crippen": 3.3872,
+      "tpsa": 46.33
+    },
+    {
+      "name": "Simvastatin",
+      "source": "bae2024",
+      "measured_kp": 0.157,
+      "model_dt_pred": 0.098583,
+      "efflux_liability": 0.089984,
+      "logp_wildman_crippen": 4.5856,
+      "tpsa": 72.83
+    },
+    {
+      "name": "Vincristine",
+      "source": "bae2024",
+      "measured_kp": 0.0821,
+      "model_dt_pred": 0.036345,
+      "efflux_liability": 0.996339,
+      "logp_wildman_crippen": 3.5175,
+      "tpsa": 171.17
+    },
+    {
+      "name": "Cetirizine",
+      "source": "bae2024",
+      "measured_kp": 0.0771,
+      "model_dt_pred": 0.047726,
+      "efflux_liability": 0.261203,
+      "logp_wildman_crippen": 3.1482,
+      "tpsa": 53.01
+    },
+    {
+      "name": "LP533401",
+      "source": "bae2024",
+      "measured_kp": 0.017,
+      "model_dt_pred": 0.034115,
+      "efflux_liability": 0.611433,
+      "logp_wildman_crippen": 5.1687,
+      "tpsa": 124.35
+    },
+    {
+      "name": "Desipramine",
+      "source": "bae2024",
+      "measured_kp": 0.3148,
+      "model_dt_pred": 0.331002,
+      "efflux_liability": 0.324492,
+      "logp_wildman_crippen": 3.5328,
+      "tpsa": 15.27
+    }
+  ]
+}
