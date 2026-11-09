@@ -1457,6 +1457,32 @@ def load_reference_compounds():
     return doc.get("compounds", []), doc.get("sources", {}), None
 
 
+@st.cache_data(show_spinner=False)
+def load_logbb_models():
+    """Published logBB equations from reference_compounds.json. Returns (models, sources)."""
+    try:
+        with open(_REF_COMPOUNDS_FILE, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return [], {}
+    return doc.get("logbb_models", []), doc.get("sources", {})
+
+
+def eval_logbb_model(model, logp, psa):
+    """Evaluate one published logBB equation. Returns a float, or None if not applicable.
+
+    Only 'linear_logp_psa' models are computable here; 'builtin' refers to the app's own
+    Tier-2 regressor, whose value comes from the pipeline rather than a closed form.
+    """
+    if model.get("kind") != "linear_logp_psa":
+        return None
+    if logp is None or psa is None:
+        return None
+    return (model.get("logp_coef", 0.0) * logp
+            + model.get("psa_coef", 0.0) * psa
+            + model.get("intercept", 0.0))
+
+
 def _ours_row(res):
     t1, abc, fu, lb = res["t1_pred"], res["abc"], res["t3_fu"], res["t2_logbb"]
     return {
@@ -2346,6 +2372,93 @@ Layer's Final Kp, shown in the Single Compound tab. This panel is an older mecha
 view kept for comparison.
                 """
             )
+
+    # ── Published logBB models ───────────────────────────────────────────────
+    # Riccardo's feedback: "add a simple menu to select a few models based on data of
+    # existing papers so that people can use this menu for simply testing hypothesis
+    # using published data." Models live in reference_compounds.json -> logbb_models.
+    st.markdown("---")
+    st.subheader("Published logBB Models")
+
+    _models, _msources = load_logbb_models()
+    if not _models:
+        st.info("No published logBB models defined. Add entries to `reference_compounds.json`.")
+    else:
+        st.caption(
+            "Run the current compound through published logBB equations alongside this app's "
+            "own Tier-2 predictor, to see how much the downstream estimate depends on which "
+            "model you believe. Add more in `reference_compounds.json` — no code change needed."
+        )
+
+        if not _tw_res:
+            st.info("Run a compound in the **🔬 Single Compound** tab to compare models on it.")
+        else:
+            _mol = mol_from_smiles(_tw_res.get("smiles", ""))
+            if _mol is None:
+                st.warning("Could not parse the current compound's SMILES.")
+            else:
+                _lp = Descriptors.MolLogP(_mol)
+                _ps = Descriptors.TPSA(_mol)   # plain TPSA (S/P excluded), as these
+                                               # equations are usually applied
+                st.caption(
+                    f"**{_tw_res.get('name') or 'compound'}** — logP {_lp:.2f}, TPSA {_ps:.2f} Å²"
+                )
+
+                _rows = []
+                for _m in _models:
+                    if _m.get("kind") == "builtin":
+                        _val = _tw_res.get("t2_logbb")
+                    else:
+                        _val = eval_logbb_model(_m, _lp, _ps)
+                    _src = _msources.get(_m.get("source") or "", {})
+                    _rows.append({
+                        "Model": _m["name"],
+                        "logBB": round(_val, 3) if _val is not None else None,
+                        "Source": _src.get("citation", "this app"),
+                    })
+                _mt = pd.DataFrame(_rows)
+                st.dataframe(_mt, hide_index=True, use_container_width=True)
+
+                _vals = [r["logBB"] for r in _rows if r["logBB"] is not None]
+                if len(_vals) > 1:
+                    _spread = max(_vals) - min(_vals)
+                    st.caption(
+                        f"**Spread across models: {_spread:.2f} logBB units** "
+                        f"({min(_vals):.2f} to {max(_vals):.2f}). For reference, the agreement "
+                        "threshold used in the external-comparison panel is 0.5."
+                    )
+                    if _spread > 0.5:
+                        st.warning(
+                            "These published models disagree by more than the panel's own "
+                            "agreement threshold on this compound — the choice of logBB model "
+                            "matters more here than any downstream correction."
+                        )
+
+                with st.expander("Model definitions and caveats", expanded=False):
+                    for _m in _models:
+                        _src = _msources.get(_m.get("source") or "", {})
+                        if _m.get("kind") == "linear_logp_psa":
+                            _eq = (f"`logBB = {_m['logp_coef']}·logP "
+                                   f"{'+' if _m['psa_coef'] >= 0 else '−'} "
+                                   f"{abs(_m['psa_coef'])}·PSA "
+                                   f"{'+' if _m['intercept'] >= 0 else '−'} "
+                                   f"{abs(_m['intercept'])}`")
+                        else:
+                            _eq = "_(no closed form — trained model)_"
+                        st.markdown(f"**{_m['name']}** — {_eq}")
+                        if _src.get("citation"):
+                            st.caption(f"{_src['citation']}"
+                                       + (f" · {_src['assay']}" if _src.get("assay") else ""))
+                        if _m.get("note"):
+                            st.caption(_m["note"])
+                        st.markdown("")
+                    st.info(
+                        "⚠ **Descriptor caveat.** These equations were fitted on their authors' own "
+                        "PSA and logP implementations. Here they are evaluated with RDKit TPSA and "
+                        "Wildman-Crippen logP — the usual substitution in the literature, but not "
+                        "identical to what the authors used. Treat cross-model differences as "
+                        "indicative, not exact."
+                    )
 
     # ── Published reference compounds ────────────────────────────────────────
     # Riccardo's feedback: "add a simple menu to select a few models based on data of

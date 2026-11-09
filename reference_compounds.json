@@ -1,11 +1,22 @@
 {
-  "_comment": "Published reference compounds for hypothesis testing in the Digital Twin tab. Values are lifted verbatim from _CALIBRATION_DATA in app.py, which in turn comes from Table 3 of the source paper. Add new entries here -- no code change needed. IMPORTANT: every compound in this seed set is part of the model's own calibration set, so agreement between prediction and measurement is NOT independent validation.",
+  "_comment": "Published reference compounds for hypothesis testing in the Digital Twin tab. Values are lifted verbatim from _CALIBRATION_DATA in app.py, which in turn comes from Table 3 of the source paper. Add new entries here -- no code change needed. IMPORTANT: every compound in this seed set is part of the model's own calibration set, so agreement between prediction and measurement is NOT independent validation. 'logbb_models' lists published logBB equations that can be run alongside the app's own Tier-2 predictor for hypothesis testing.",
   "sources": {
     "bae2024": {
       "citation": "Yang, Shin, Jeong, Bae et al., Pharmaceutics 2024, 16(5), 574",
       "doi": "10.3390/pharmaceutics16050574",
       "assay": "Human BBB-on-a-chip; Kp = brain-side:vascular-side partition coefficient",
       "in_calibration_set": true
+    },
+    "clark1999": {
+      "citation": "Clark DE, J Pharm Sci 1999, 88(8), 815-821",
+      "title": "Rapid calculation of polar molecular surface area and its application to the prediction of transport phenomena. 2. Prediction of blood-brain barrier penetration",
+      "assay": "QSAR regression on 55 diverse organic compounds; reported R^2 = 0.787",
+      "in_calibration_set": false
+    },
+    "rishton2006": {
+      "citation": "Rishton GM et al., 2006",
+      "assay": "Linear logBB model in the same two-descriptor family as Clark 1999",
+      "in_calibration_set": false
     }
   },
   "compounds": [
@@ -98,6 +109,35 @@
       "efflux_liability": 0.324492,
       "logp_wildman_crippen": 3.5328,
       "tpsa": 15.27
+    }
+  ],
+  "logbb_models": [
+    {
+      "id": "app_tier2",
+      "name": "This app \u2014 Tier 2 stacked ML",
+      "source": null,
+      "kind": "builtin",
+      "note": "Stacked RF/XGB -> Ridge regressor trained in this pipeline (CV R^2 = 0.604). The default."
+    },
+    {
+      "id": "clark1999",
+      "name": "Clark 1999",
+      "source": "clark1999",
+      "kind": "linear_logp_psa",
+      "logp_coef": 0.152,
+      "psa_coef": -0.0148,
+      "intercept": 0.139,
+      "note": "Two-descriptor QSAR. Published using Clark's own rapid PSA and clogP; here it is evaluated with RDKit TPSA and Wildman-Crippen logP, which is the usual substitution but is NOT identical to the descriptors Clark fitted on."
+    },
+    {
+      "id": "rishton2006",
+      "name": "Rishton 2006",
+      "source": "rishton2006",
+      "kind": "linear_logp_psa",
+      "logp_coef": 0.155,
+      "psa_coef": -0.01,
+      "intercept": 0.164,
+      "note": "Same descriptor family as Clark 1999, with a notably weaker PSA penalty. Same descriptor-substitution caveat applies."
     }
   ]
 }
