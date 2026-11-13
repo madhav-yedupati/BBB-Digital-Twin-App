@@ -516,14 +516,28 @@ class DecisionLayerV2:
 
 
 @st.cache_resource
-def fit_decision_layer():
-    """Fits TransportAgent/UptakeAgent once on the 10-compound calibration set
-    (cached for the life of the app process, not re-fit per request)."""
-    twins = [DigitalTwin(c, dt_pred, actual) for c, actual, dt_pred, *_ in _CALIBRATION_DATA]
+def fit_decision_layer(exclude: tuple = ()):
+    """Fits TransportAgent/UptakeAgent on the 10-compound calibration set.
+
+    `exclude` names compounds to LEAVE OUT of the fit. This exists so a compound
+    can be evaluated without the agents having seen its measured Kp -- i.e. a
+    genuine leave-one-out prediction rather than a recall of the fitted value.
+    Default () reproduces the original all-10 fit exactly.
+
+    Cached per exclusion set, so the common exclude=() path is still fitted once.
+    """
+    rows = [r for r in _CALIBRATION_DATA if r[0] not in exclude]
+    if len(rows) < 3:
+        # Too little left to fit a meaningful posterior; caller should fall back.
+        raise ValueError(
+            f"Excluding {exclude} leaves only {len(rows)} calibration compounds — "
+            "not enough to fit the Bayesian agents."
+        )
+    twins = [DigitalTwin(c, dt_pred, actual) for c, actual, dt_pred, *_ in rows]
     efflux_adj = np.array([
-        eff * _LITERATURE_DISCOUNT.get(c, 1.0) for c, _, _, eff, *_ in _CALIBRATION_DATA
+        eff * _LITERATURE_DISCOUNT.get(c, 1.0) for c, _, _, eff, *_ in rows
     ])
-    uptake_p = np.array([UPTAKE_EVIDENCE_V2.get(c, (0.0,))[0] for c, *_ in _CALIBRATION_DATA])
+    uptake_p = np.array([UPTAKE_EVIDENCE_V2.get(c, (0.0,))[0] for c, *_ in rows])
     ta = TransportAgent().fit(twins, efflux_adj)
     ua = UptakeAgent().fit(twins, uptake_p)
     dl = DecisionLayerV2()
@@ -545,7 +559,8 @@ _CALIBRATION_BY_NAME = {row[0]: row for row in _CALIBRATION_DATA}
 
 
 def run_decision_layer(compound_name, predicted_kp, efflux_liability,
-                        uptake_evidence_p=0.0, uptake_transporter=None, uptake_note=""):
+                        uptake_evidence_p=0.0, uptake_transporter=None, uptake_note="",
+                        holdout=False):
     """Runs a compound through the frozen Decision Layer -> Biological Agents ->
     Decision Engine chain. Returns (final_kp, decision_dict, matched_name). If
     the compound matches one of the 10 validated calibration compounds, the
@@ -553,15 +568,37 @@ def run_decision_layer(compound_name, predicted_kp, efflux_liability,
     (rather than a fresh, slightly-drifted live re-inference) so the validated
     case studies reproduce exactly, and the curated literature discount /
     uptake evidence are applied automatically."""
-    ta, ua, dl = fit_decision_layer()
     matched = lookup_calibration_compound(compound_name)
 
-    if matched:
+    # ── Held-out mode ─────────────────────────────────────────────────────────
+    # Normally a calibration-set compound has its stored notebook dt_pred and
+    # efflux_liability substituted in, and a curated per-compound literature
+    # discount applied, so the published case studies reproduce exactly. Those
+    # stored values were derived alongside the same measured Kp the agents were
+    # fitted against -- so comparing the result back to that measured Kp is
+    # circular. holdout=True removes every such path:
+    #   * no stored-value substitution (live Tier-2 / ABC outputs are used)
+    #   * no per-compound literature discount
+    #   * agents refitted with this compound left out of the fit
+    # Curated uptake literature evidence IS retained: it comes from independent
+    # published transporter studies, not from the chip measurements, and the
+    # architecture requires the uptake gate to rest on literature rather than an
+    # ML guess. Set uptake_evidence_p=0.0 by hand if you want that excluded too.
+    if holdout and matched:
+        try:
+            ta, ua, dl = fit_decision_layer(exclude=(matched,))
+        except ValueError:
+            ta, ua, dl = fit_decision_layer()
+            holdout = False          # not enough data to hold out; report honestly
+    else:
+        ta, ua, dl = fit_decision_layer()
+
+    if matched and not holdout:
         _, _actual, cal_dt_pred, cal_efflux, *_ = _CALIBRATION_BY_NAME[matched]
         predicted_kp = cal_dt_pred
         efflux_liability = cal_efflux
 
-    discount = _LITERATURE_DISCOUNT.get(matched, 1.0)
+    discount = 1.0 if holdout else _LITERATURE_DISCOUNT.get(matched, 1.0)
     efflux_adj = efflux_liability * discount
 
     if matched and matched in UPTAKE_EVIDENCE_V2:
@@ -1863,6 +1900,31 @@ with tab1:
         ),
     )
 
+    # ── Held-out evaluation ───────────────────────────────────────────────────
+    # For the 10 calibration compounds the app normally replays stored notebook
+    # values, because the Bayesian agents were fitted against those same measured
+    # Kp values. Comparing that output back to the measured Kp is circular. This
+    # switch makes the pipeline predict those compounds from scratch instead.
+    st.checkbox(
+        "🔒 Held-out evaluation (for validation runs)",
+        key="holdout_mode",
+        help=(
+            "Off (default): calibration compounds reproduce the published case studies "
+            "exactly, using stored notebook values and a per-compound literature discount. "
+            "On: those are bypassed and the Bayesian agents are refitted with this compound "
+            "left out, so the prediction has not seen its measured Kp. Use this — and say so — "
+            "for any number you intend to report as validation. Compounds outside the "
+            "calibration set are unaffected either way."
+        ),
+    )
+    if st.session_state.get("holdout_mode"):
+        st.caption(
+            "🔒 **Held-out mode on.** Stored calibration values and the literature discount are "
+            "bypassed; agents refit without the current compound. Curated *uptake literature* "
+            "evidence is retained by design — it comes from independent transporter studies, not "
+            "from the chip measurements."
+        )
+
     predict_btn = st.button("🚀 Run Full Pipeline", type="primary", use_container_width=False)
 
     # Compute once on click and keep in session_state, so flipping Basic/Advanced
@@ -1886,11 +1948,13 @@ with tab1:
                 compound_display_name = drug_name.strip() or smiles[:24]
                 if t2_logbb is not None and abc_result is not None:
                     predicted_kp = 10 ** t2_logbb
+                    _holdout = bool(st.session_state.get("holdout_mode", False))
                     final_kp, decision, matched, predicted_kp = run_decision_layer(
                         compound_display_name, predicted_kp, abc_result["efflux_liability"],
                         uptake_evidence_p=manual_uptake_p,
                         uptake_transporter=manual_uptake_transporter or None,
                         uptake_note=manual_uptake_note,
+                        holdout=_holdout,
                     )
 
                 efflux_ratio = 1.0
@@ -1907,6 +1971,9 @@ with tab1:
                     abc=abc_result, final_kp=final_kp, decision=decision, matched=matched,
                     predicted_kp=predicted_kp, efflux_ratio=efflux_ratio,
                     papp_plasma=papp_plasma, papp_free=papp_free,
+                    # Recorded so every downstream panel can label the number
+                    # honestly, and so an exported result says how it was produced.
+                    holdout=bool(st.session_state.get("holdout_mode", False)),
                 )
             except ValueError as e:
                 st.session_state.pop("t1_res", None)
@@ -1996,8 +2063,19 @@ with tab1:
                 "over-predicted). See **Advanced → blind spots** for the full list."
             )
             if matched:
-                st.info(f"Matched to validated calibration compound **{matched}**: stored notebook "
-                        "values are used for the Decision Layer, so this is not an independent model test.")
+                if res.get("holdout"):
+                    st.success(
+                        f"🔒 **{matched}** is a calibration compound, evaluated in **held-out mode**: "
+                        "stored notebook values and the literature discount were bypassed and the "
+                        "agents were refitted without it. This prediction has not seen its measured Kp, "
+                        "so it is safe to compare against."
+                    )
+                else:
+                    st.info(
+                        f"Matched to validated calibration compound **{matched}**: stored notebook "
+                        "values are used for the Decision Layer, so this is **not** an independent model "
+                        "test. Tick **Held-out evaluation** above and re-run to get a comparable number."
+                    )
             st.markdown("### 1 · Passive transport")
             if decision is not None:
                 c1, c2, c3 = st.columns(3)
@@ -2102,9 +2180,14 @@ with tab1:
                 )
                 if matched:
                     st.success(
-                        f"✅ Matched to validated calibration compound **{matched}** — using the "
-                        "published DT prediction / efflux score from the notebook (not a fresh live "
-                        "re-inference), plus the curated literature discount/uptake evidence."
+                        (f"🔒 Calibration compound **{matched}** in **held-out mode** — live Tier-2 / "
+                         "ABC outputs, no literature discount, agents refitted without this compound. "
+                         "Independent of its measured Kp.")
+                        if res.get("holdout") else
+                        (f"✅ Matched to validated calibration compound **{matched}** — using the "
+                         "published DT prediction / efflux score from the notebook (not a fresh live "
+                         "re-inference), plus the curated literature discount/uptake evidence. "
+                         "**Not** an independent test.")
                     )
                 c1, c2, c3 = st.columns(3)
                 c1.metric("DT alone (Kp)", f"{res['predicted_kp']:.4f}")
