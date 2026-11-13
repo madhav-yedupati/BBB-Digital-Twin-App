@@ -313,6 +313,87 @@ def test_admetlab_explanation_block_cannot_shadow_real_values():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Held-out evaluation (circularity guard)
+# ══════════════════════════════════════════════════════════════════════════════
+# The 10 Bae et al. compounds ARE the set the Bayesian agents were fitted on, and
+# for those compounds the app normally replays stored notebook values. Comparing
+# that output back to the measured Kp is circular. holdout=True must remove every
+# such path. These tests exist because that property is easy to undo by accident
+# and impossible to notice from the UI.
+def test_holdout_row_exclusion_drops_the_named_compound():
+    src = open(APP, encoding="utf-8").read()
+    block = re.search(r"_CALIBRATION_DATA = \[(.*?)\n\]", src, re.S).group(1)
+    names = re.findall(r'\("([^"]+)",', block)
+    assert len(names) == 10, f"expected 10 calibration compounds, found {len(names)}"
+
+    # mirrors the filter inside fit_decision_layer()
+    for target in ("Caffeine", "Donepezil"):
+        kept = [n for n in names if n not in (target,)]
+        assert target not in kept
+        assert len(kept) == 9
+
+
+def test_holdout_refuses_when_too_little_data_remains():
+    """fit_decision_layer must raise rather than fit a meaningless posterior."""
+    src = open(APP, encoding="utf-8").read()
+    fn = re.search(r"^def fit_decision_layer\(.*?(?=\n\n\n)", src, re.S | re.M).group(0)
+    assert "if len(rows) < 3:" in fn, "the minimum-rows guard is gone"
+    assert "raise ValueError" in fn, "it no longer raises when it cannot fit"
+
+
+def test_holdout_gates_every_leakage_path():
+    """Source-level assertions, deliberately.
+
+    These guard a property, not a return value: that no path reintroduces
+    measured-Kp-derived information into a held-out prediction. Each assertion
+    names the specific leak it prevents, so a failure says what broke.
+    """
+    src = open(APP, encoding="utf-8").read()
+    fn = re.search(r"^def run_decision_layer\(.*?(?=\n\n\n)", src, re.S | re.M).group(0)
+
+    assert "holdout=False" in fn, "run_decision_layer lost its holdout parameter"
+
+    assert "if matched and not holdout:" in fn, (
+        "LEAK: stored notebook dt_pred/efflux_liability are being substituted even in "
+        "held-out mode — the prediction would be a recall of the fitted value"
+    )
+    assert "discount = 1.0 if holdout else" in fn, (
+        "LEAK: the per-compound literature discount is applied in held-out mode — that "
+        "discount was tuned on these specific compounds"
+    )
+    assert "fit_decision_layer(exclude=(matched,))" in fn, (
+        "LEAK: agents are no longer refitted without the held-out compound, so their "
+        "posteriors have still seen its measured Kp"
+    )
+
+
+def test_holdout_state_is_recorded_on_the_result():
+    """Any reported number must carry how it was produced."""
+    src = open(APP, encoding="utf-8").read()
+    assert 'holdout=bool(st.session_state.get("holdout_mode"' in src, (
+        "the result dict no longer records whether held-out mode was on — downstream "
+        "panels would label validation numbers wrongly"
+    )
+    assert 'key="holdout_mode"' in src, "the held-out toggle is gone from the UI"
+
+
+def test_uptake_literature_evidence_is_retained_in_holdout():
+    """Deliberate design choice, asserted so it isn't 'fixed' silently.
+
+    Curated uptake evidence comes from independent published transporter studies,
+    not from the chip measurements, and the frozen architecture requires the uptake
+    gate to rest on literature rather than an ML guess. So it is NOT gated on
+    holdout. If that ever changes it should be a conscious decision.
+    """
+    src = open(APP, encoding="utf-8").read()
+    fn = re.search(r"^def run_decision_layer\(.*?(?=\n\n\n)", src, re.S | re.M).group(0)
+    assert "if matched and matched in UPTAKE_EVIDENCE_V2:" in fn, (
+        "the uptake-evidence lookup changed shape; re-check whether it is still "
+        "independent of the measured Kp"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 def _main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
