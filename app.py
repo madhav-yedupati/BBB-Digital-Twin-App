@@ -1248,8 +1248,18 @@ def boiled_egg(smiles):
     phosphorus-containing compounds; that is intentional, so this row reproduces
     SwissADME rather than our internal descriptor set.
     """
-    mol = mol_from_smiles(smiles)
-    if mol is None:
+    # mol_from_smiles RAISES ValueError on an unparseable SMILES (and when RDKit
+    # is missing) -- it does not return None. Letting that propagate would take
+    # down the whole comparison panel for one bad structure.
+    if not smiles or not smiles.strip():
+        return None
+    try:
+        mol = mol_from_smiles(smiles)
+    except ValueError:
+        return None
+    # Chem.MolFromSmiles("") returns a VALID but empty Mol rather than None, which
+    # would otherwise yield TPSA 0 / logP 0 and a confident, meaningless call.
+    if mol is None or mol.GetNumAtoms() == 0:
         return None
     try:
         tpsa = Descriptors.TPSA(mol, includeSandP=True)
